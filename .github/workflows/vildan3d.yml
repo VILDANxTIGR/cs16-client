@@ -214,6 +214,16 @@ jobs:
           ])
           if c.count(old_in) == 1: c = c.replace(old_in, new_in, 1)
           c_path.write_text(c)
+          # 8. ПАТЧ MENU FACTORY (тот самый из #38)
+          mf_path = Path("client/cl_dll/cdll_int.cpp")
+          if mf_path.exists():
+              mfc = mf_path.read_text()
+              old_mf = 'static void LoadMenuInterface( void )\n{\n\tif( g_pMenu )\n\t\treturn;\n\n\tg_pMenu = GetNativeMenuExports();\n\tif( !g_pMenu )\n\t\tHUD_MessageBox( "Error: native object \\"MenuFactory\\" is unavailable\\n" );\n}'
+              new_mf = 'static void LoadMenuInterface( void )\n{\n\tg_pMenu = nullptr;\n}'
+              if mfc.count(old_mf) == 1:
+                  mfc = mfc.replace(old_mf, new_mf, 1)
+                  mf_path.write_text(mfc)
+                  print("MenuFactory patched")
       - name: Init submodules
         shell: bash
         run: |
