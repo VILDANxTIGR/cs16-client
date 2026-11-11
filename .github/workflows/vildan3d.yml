@@ -89,13 +89,14 @@ jobs:
 
       - name: Setup ImGui
         run: |
-          mkdir -p engine/3rdparty
-          git clone --depth 1 https://github.com/ocornut/imgui.git engine/3rdparty/imgui
+          rm -rf engine/3rdparty/imgui
+          git clone --depth 1 --branch v1.90.5 https://github.com/ocornut/imgui.git engine/3rdparty/imgui
 
       - name: Patch Engine for ImGui and configure-ninja.py
         shell: python3 {0}
         run: |
           import os
+          import re
           from pathlib import Path
 
           # 1. Патчим configure-ninja.py
@@ -129,14 +130,13 @@ jobs:
           p.write_text(s)
           print("configure-ninja.py: error checks added")
 
-          # 2. Создаем файлы ImGui с принудительным GLES2
+          # 2. Создаем файлы ImGui
           header_cpp = "#pragma once\n#ifdef __cplusplus\nextern \"C\" {\n#endif\nvoid VILDAN_Init(void);\nvoid VILDAN_DrawMenu(void);\n#ifdef __cplusplus\n}\n#endif\n"
           with open("engine/ref/gl/vildan_menu.h", "w") as f:
               f.write(header_cpp)
 
           menu_cpp = (
               '#include "vildan_menu.h"\n'
-              '#define IMGUI_IMPL_OPENGL_ES2\n'
               '#include "imgui.h"\n'
               '#include "imgui_impl_opengl3.h"\n'
               'extern "C" void VILDAN_Init(void)\n'
@@ -160,7 +160,7 @@ jobs:
           with open("engine/ref/gl/vildan_menu.cpp", "w") as f:
               f.write(menu_cpp)
 
-          # 3. Патчим wscript с проверкой find_node
+          # 3. Патчим wscript (с безопасным re.subn)
           wscript_path = "engine/ref/gl/wscript"
           with open(wscript_path, "r") as f:
               w = f.read()
@@ -169,30 +169,54 @@ jobs:
           if w.count(source_marker) != 1:
               raise RuntimeError("Unexpected source declaration in wscript")
               
-          patch_code = (
+          w = w.replace(
+              source_marker,
               "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])\n"
               "imgui_dir = bld.srcnode.find_dir('3rdparty/imgui')\n"
-              "if not imgui_dir:\n"
-              "    bld.fatal('ImGui dir not found')\n"
+              "if not imgui_dir: bld.fatal('ImGui dir not found')\n"
               "imgui_files = ['imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp', 'backends/imgui_impl_opengl3.cpp']\n"
               "for f in imgui_files:\n"
               "    if not imgui_dir.find_node(f):\n"
               "        bld.fatal('Missing ImGui file: ' + f)\n"
               "if not bld.path.find_node('vildan_menu.cpp'):\n"
               "    bld.fatal('Missing vildan_menu.cpp')\n"
-              "source += [imgui_dir.find_node(f) for f in imgui_files] + [bld.path.find_node('vildan_menu.cpp')]\n"
-              "includes = ['.', imgui_dir.abspath(), imgui_dir.find_dir('backends').abspath()]"
+              "imgui_sources = [imgui_dir.find_node(f) for f in imgui_files] + [bld.path.find_node('vildan_menu.cpp')]\n"
+              "imgui_includes = [imgui_dir.abspath(), imgui_dir.find_dir('backends').abspath()]",
+              1
           )
-          w = w.replace(source_marker, patch_code, 1)
           
-          if w.count("features = 'format'") != 1:
-              raise RuntimeError("Unexpected Waf features declaration")
-          w = w.replace("features = 'format'", "features = ['c', 'cxx', 'cxxshlib', 'format']", 1)
+          # Подменяем создание shlib, чтобы ImGui не попадал в ref_gles1
+          pattern = r"bld\.shlib\(\s*source\s*=\s*source,\s*target\s*=\s*k,\s*includes\s*=\s*includes,\s*features\s*=\s*'format',\s*use\s*=\s*libs\s*\+\s*v\['libs'\],\s*defines\s*=\s*v\['defines'\]\s*\+\s*\['REF_DLL=1'\],\s*install_path\s*=\s*bld\.env\.LIBDIR\s*\)"
+          replacement = """if k != 'ref_gles1':
+              target_source = source + imgui_sources
+              base_includes = includes if isinstance(includes, list) else [includes]
+              target_includes = base_includes + ['.'] + imgui_includes
+              target_features = ['c', 'cxx', 'cxxshlib', 'format']
+              target_defines = v['defines'] + ['REF_DLL=1', 'VILDAN_IMGUI=1', 'IMGUI_IMPL_OPENGL_ES2=1']
+          else:
+              target_source = source
+              target_includes = includes
+              target_features = 'format'
+              target_defines = v['defines'] + ['REF_DLL=1']
           
+          bld.shlib(
+              source = target_source,
+              target = k,
+              includes = target_includes,
+              features = target_features,
+              use = libs + v['libs'],
+              defines = target_defines,
+              install_path = bld.env.LIBDIR
+          )"""
+          
+          w, count = re.subn(pattern, replacement, w)
+          if count != 1:
+              raise RuntimeError("Expected to patch exactly one bld.shlib call, patched {}".format(count))
+
           with open(wscript_path, "w") as f:
               f.write(w)
 
-          # 4. Патчим gl_opengl.c и gl_rmain.c
+          # 4. Патчим gl_opengl.c и gl_rmain.c с #ifdef
           opengl_path = "engine/ref/gl/gl_opengl.c"
           with open(opengl_path, "r") as f:
               o = f.read()
@@ -202,7 +226,7 @@ jobs:
           marker = '// see R_ProcessEntData for tr.entities initialization'
           if marker not in o:
               raise RuntimeError("R_Init_Video marker not found in gl_opengl.c")
-          o = o.replace(marker, 'VILDAN_Init();\n\n\t' + marker, 1)
+          o = o.replace(marker, '#ifdef VILDAN_IMGUI\n\tVILDAN_Init();\n#endif\n\n\t' + marker, 1)
           with open(opengl_path, "w") as f:
               f.write(o)
 
@@ -214,20 +238,28 @@ jobs:
 
           if 'gEngfuncs.GL_SwapBuffers();' not in m:
               raise RuntimeError("GL_SwapBuffers not found in gl_rmain.c")
-          m = m.replace('gEngfuncs.GL_SwapBuffers();', 'VILDAN_DrawMenu();\n\tgEngfuncs.GL_SwapBuffers();')
+          m = m.replace('gEngfuncs.GL_SwapBuffers();', '#ifdef VILDAN_IMGUI\n\tVILDAN_DrawMenu();\n#endif\n\tgEngfuncs.GL_SwapBuffers();')
           with open(main_path, "w") as f:
               f.write(m)
 
       - name: Init submodules
+        shell: bash
         run: |
           set -euo pipefail
+
           for d in engine client; do
-            pushd "$d"
-            if git ls-files --stage | grep -q '^160000'; then
-              git submodule sync --recursive && git submodule update --init --recursive
-            fi
-            popd
+            echo "Initializing submodules in $d"
+            git -C "$d" submodule sync --recursive
+            git -C "$d" submodule update --init --recursive
           done
+
+          echo "Checking engine mainui submodule..."
+          test -f engine/3rdparty/mainui/CMakeLists.txt || {
+            echo "::error::Engine mainui submodule is missing!"
+            exit 1
+          }
+
+          echo "Engine mainui submodule is ready."
 
       - name: Prepare reliable downloads
         shell: bash
@@ -302,7 +334,8 @@ jobs:
           sed -i 's/setOf("armeabi-v7a", "arm64-v8a", "x86")/setOf("arm64-v8a")/' android/app/build.gradle.kts
           grep -q 'setOf("arm64-v8a")' android/app/build.gradle.kts || { echo "::error::Could not configure arm64-v8a ABI"; exit 1; }
           
-          sed -i 's/assembleContinuous --no-daemon/assembleContinuous --no-daemon --info --stacktrace/' scripts/gha/build_android.sh || true
+          sed -i 's/assembleContinuous --no-daemon/assembleContinuous --no-daemon --info --stacktrace/' scripts/gha/build_android.sh
+          grep -q 'assembleContinuous --no-daemon --info --stacktrace' scripts/gha/build_android.sh || { echo "::error::Could not configure Gradle diagnostics"; exit 1; }
           
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/deps_android.sh
           
