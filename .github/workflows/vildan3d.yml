@@ -44,12 +44,10 @@ jobs:
         run: |
           import os
 
-          # 1. Создаем заголовочный файл
           header_cpp = "#pragma once\n#ifdef __cplusplus\nextern \"C\" {\n#endif\nvoid VILDAN_Init(void);\nvoid VILDAN_DrawMenu(void);\n#ifdef __cplusplus\n}\n#endif\n"
           with open("engine/ref/gl/vildan_menu.h", "w") as f:
               f.write(header_cpp)
 
-          # 2. Создаем файл реализации
           menu_cpp = (
               '#include "vildan_menu.h"\n'
               '#include "imgui.h"\n'
@@ -75,31 +73,28 @@ jobs:
           with open("engine/ref/gl/vildan_menu.cpp", "w") as f:
               f.write(menu_cpp)
 
-          # 3. Патчим wscript (ФИКС ОШИБКИ С features)
           wscript_path = "engine/ref/gl/wscript"
           with open(wscript_path, "r") as f:
               w = f.read()
           
-          if "source = bld.path.ant_glob" in w:
-              w = w.replace(
-                  "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])",
-                  "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])\n"
-                  "imgui_dir = bld.srcnode.find_dir('3rdparty/imgui')\n"
-                  "source += [imgui_dir.find_node('imgui.cpp'), imgui_dir.find_node('imgui_draw.cpp'), imgui_dir.find_node('imgui_tables.cpp'), imgui_dir.find_node('imgui_widgets.cpp'), imgui_dir.find_node('backends/imgui_impl_opengl3.cpp'), bld.path.find_node('vildan_menu.cpp')]\n"
-                  "includes = ['.', imgui_dir.abspath(), imgui_dir.find_dir('backends').abspath()]"
-              )
-              
-              # Заменяем существующий features, а не добавляем новый
-              if w.count("features = 'format'") != 1:
-                  raise RuntimeError("Unexpected Waf features declaration")
-              w = w.replace("features = 'format'", "features = ['c', 'cxx', 'cxxshlib', 'format']", 1)
-              
-              with open(wscript_path, "w") as f:
-                  f.write(w)
-          else:
+          if "source = bld.path.ant_glob" not in w:
               raise RuntimeError("Could not find source in wscript")
+              
+          w = w.replace(
+              "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])",
+              "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])\n"
+              "imgui_dir = bld.srcnode.find_dir('3rdparty/imgui')\n"
+              "source += [imgui_dir.find_node('imgui.cpp'), imgui_dir.find_node('imgui_draw.cpp'), imgui_dir.find_node('imgui_tables.cpp'), imgui_dir.find_node('imgui_widgets.cpp'), imgui_dir.find_node('backends/imgui_impl_opengl3.cpp'), bld.path.find_node('vildan_menu.cpp')]\n"
+              "includes = ['.', imgui_dir.abspath(), imgui_dir.find_dir('backends').abspath()]"
+          )
+          
+          if w.count("features = 'format'") != 1:
+              raise RuntimeError("Unexpected Waf features declaration")
+          w = w.replace("features = 'format'", "features = ['c', 'cxx', 'cxxshlib', 'format']", 1)
+          
+          with open(wscript_path, "w") as f:
+              f.write(w)
 
-          # 4. Патчим gl_opengl.c (Вставляем перед комментарием, после R_Init_Video)
           opengl_path = "engine/ref/gl/gl_opengl.c"
           with open(opengl_path, "r") as f:
               o = f.read()
@@ -107,24 +102,21 @@ jobs:
               o = '#include "vildan_menu.h"\n' + o
           
           marker = '// see R_ProcessEntData for tr.entities initialization'
-          if marker in o:
-              o = o.replace(marker, 'VILDAN_Init();\n\n\t' + marker, 1)
-          else:
+          if marker not in o:
               raise RuntimeError("R_Init_Video marker not found in gl_opengl.c")
+          o = o.replace(marker, 'VILDAN_Init();\n\n\t' + marker, 1)
           with open(opengl_path, "w") as f:
               f.write(o)
 
-          # 5. Патчим gl_rmain.c (Вставляем отрисовку)
           main_path = "engine/ref/gl/gl_rmain.c"
           with open(main_path, "r") as f:
               m = f.read()
           if '#include "vildan_menu.h"' not in m:
               m = '#include "vildan_menu.h"\n' + m
 
-          if 'gEngfuncs.GL_SwapBuffers();' in m:
-              m = m.replace('gEngfuncs.GL_SwapBuffers();', 'VILDAN_DrawMenu();\n\tgEngfuncs.GL_SwapBuffers();')
-          else:
+          if 'gEngfuncs.GL_SwapBuffers();' not in m:
               raise RuntimeError("GL_SwapBuffers not found in gl_rmain.c")
+          m = m.replace('gEngfuncs.GL_SwapBuffers();', 'VILDAN_DrawMenu();\n\tgEngfuncs.GL_SwapBuffers();')
           with open(main_path, "w") as f:
               f.write(m)
 
@@ -187,16 +179,24 @@ jobs:
           export FFMPEG_VERSION=9.0
           
           cd engine
-          # Синхронизируем версию NDK в скрипте сборки
+          # Жестко синхронизируем версию NDK в скрипте установки
           sed -i 's/ANDROID_NDK_VERSION="29.0.14206865"/ANDROID_NDK_VERSION="28.2.13676358"/' scripts/gha/deps_android.sh || true
+          
+          # Принудительно ставим правильную версию в build.gradle.kts
+          sed -i 's/ndkVersion = "29.0.14206865"/ndkVersion = "28.2.13676358"/' android/app/build.gradle.kts || true
+          
+          # Ограничиваем ABI
           sed -i 's/setOf("armeabi-v7a", "arm64-v8a", "x86")/setOf("arm64-v8a")/' android/app/build.gradle.kts
           
+          # Запускаем скрипт зависимостей
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/deps_android.sh
           
+          # Указываем переменные окружения и local.properties
           export ANDROID_HOME="$PWD/sdk"
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
-          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
+          printf 'sdk.dir=%s\nndk.dir=%s\n' "$ANDROID_HOME" "$ANDROID_NDK_HOME" > android/local.properties
           
+          # Собираем движок
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/build_android.sh
 
       - name: Collect APKs
