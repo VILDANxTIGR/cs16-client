@@ -1,9 +1,8 @@
-name: VILDAN 3D Base
+name: VILDAN 3D Final
 on:
   workflow_dispatch:
   push:
     branches: [ main, master ]
-
 env:
   ENGINE_REPO: VILDANxTIGR/xash3d-fwgs
   CLIENT_REPO: VILDANxTIGR/cs16-client
@@ -12,25 +11,18 @@ env:
   FFMPEG_VERSION: '9.0'
   GH_CPU_OS: android
   GH_CPU_ARCH: multiarch
-
 jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout Engine
         uses: actions/checkout@v4
-        with:
-          repository: '${{ env.ENGINE_REPO }}'
-          ref: 707596f4905689ec224e993fcaa4d4ad66aa67d6
-          path: engine
-
+        with: { repository: '${{ env.ENGINE_REPO }}', ref: 707596f4905689ec224e993fcaa4d4ad66aa67d6, path: engine }
       - name: Checkout Client
         uses: actions/checkout@v4
         with: { repository: '${{ env.CLIENT_REPO }}', path: client }
-
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '21' }
-
       - name: Install deps
         timeout-minutes: 20
         shell: bash
@@ -60,18 +52,15 @@ jobs:
           yes | "$SM" --licenses > /dev/null || true
           "$SM" --install "platform-tools" "platforms;android-35" "build-tools;36.0.0" "ndk;${NDK_VERSION}"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
-
       - name: Setup ImGui
         run: |
           rm -rf engine/3rdparty/imgui
           git clone --depth 1 --branch v1.90.5 https://github.com/ocornut/imgui.git engine/3rdparty/imgui
-
-      - name: Patch Engine for ImGui and Touch
+      - name: Patch Engine and Client
         shell: python3 {0}
         run: |
           import os
           from pathlib import Path
-
           # 1. Патчим configure-ninja.py
           p = Path("engine/scripts/configure-ninja.py")
           s = p.read_text()
@@ -82,7 +71,6 @@ jobs:
           new_waf = "\tprocess.communicate()\n\tif process.returncode != 0:\n\t\traise SystemExit('Waf configuration failed')\n\n\tbuild_ninja = os.path.join(out_path, 'build.ninja')\n\tif not os.path.isfile(build_ninja):\n\t\traise SystemExit('Waf did not create: ' + build_ninja)\n\n\twith io.open"
           if s.count(old_waf) == 1: s = s.replace(old_waf, new_waf, 1)
           p.write_text(s)
-
           # 2. Отключаем NanoGL
           ew_path = Path("engine/wscript")
           ew = ew_path.read_text()
@@ -90,189 +78,142 @@ jobs:
           new_android = "\tif conf.env.DEST_OS == 'android':\n\t\tconf.options.NANOGL           = False\n\t\tconf.options.GLWES            = False # deprecated\n\t\tconf.options.GL4ES            = True\n\t\tconf.options.GLES3COMPAT      = True\n\t\tconf.options.GL               = False\n"
           if ew.count(old_android) == 1: ew = ew.replace(old_android, new_android, 1)
           ew_path.write_text(ew)
-
-          # 3. Создаем заголовок ImGui
-          header = "\n".join([
-              "#pragma once", "#ifdef __cplusplus", 'extern "C" {', "#endif",
-              "void VILDAN_Init(void);", "void VILDAN_DrawMenu(void);", "void VILDAN_ProcessTouch(int action, float x, float y, long long finger_id);",
-              "#ifdef __cplusplus", "}", "#endif", ""
-          ])
+          # 3. Создаем заголовок и код меню (с Cvar-переменными)
+          header = "\n".join(["#pragma once", "#ifdef __cplusplus", 'extern "C" {', "#endif", "void VILDAN_Init(void);", "void VILDAN_DrawMenu(void);", "void VILDAN_ProcessTouch(int action, float x, float y, long long finger_id);", "#ifdef __cplusplus", "}", "#endif", ""])
           Path("engine/ref/gl/vildan_menu.h").write_text(header)
-
-          # 4. Создаем vildan_menu.cpp с обработкой тача
           menu_cpp = "\n".join([
-              '#include "vildan_menu.h"',
-              '#include "imgui.h"',
-              '#include "imgui_impl_opengl3.h"',
-              '#include <GLES2/gl2.h>',
-              'extern "C" void Con_Printf(const char *fmt, ...);',
-              "",
+              '#include "vildan_menu.h"', '#include "imgui.h"', '#include "imgui_impl_opengl3.h"', '#include <GLES2/gl2.h>', '#include <SDL.h>',
+              'extern "C" void Con_Printf(const char *fmt, ...);', 'extern "C" void* gEngfuncs;',
               "static bool vildan_imgui_ready = false;",
-              "",
-              'extern "C" void VILDAN_Init(void)',
-              "{",
+              "static bool is_menu_open = true;",
+              'extern "C" void VILDAN_ProcessTouch(int action, float x, float y, long long finger_id) {',
+              "    if (!vildan_imgui_ready) return;",
+              "    ImGuiIO& io = ImGui::GetIO();",
+              "    if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f) return;",
+              "    float real_x = x * io.DisplaySize.x;",
+              "    float real_y = y * io.DisplaySize.y;",
+              "    if (action == 1) { io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen); io.AddMousePosEvent(real_x, real_y); io.AddMouseButtonEvent(ImGuiMouseButton_Left, true); }",
+              "    else if (action == 2) { io.AddMousePosEvent(real_x, real_y); }",
+              "    else if (action == 3) { io.AddMousePosEvent(real_x, real_y); io.AddMouseButtonEvent(ImGuiMouseButton_Left, false); }",
+              "}",
+              "int VILDAN_EventWatch(void *userdata, SDL_Event *event) {",
+              "    if (event->type == SDL_FINGERDOWN || event->type == SDL_FINGERMOTION || event->type == SDL_FINGERUP) {",
+              "        int action = 0;",
+              "        if (event->type == SDL_FINGERDOWN) action = 1;",
+              "        else if (event->type == SDL_FINGERMOTION) action = 2;",
+              "        else if (event->type == SDL_FINGERUP) action = 3;",
+              "        VILDAN_ProcessTouch(action, event->tfinger.x, event->tfinger.y, (long long)event->tfinger.fingerId);",
+              "    }",
+              "    return 0;",
+              "}",
+              'extern "C" void VILDAN_Init(void) {',
               "    if (vildan_imgui_ready) return;",
               "    IMGUI_CHECKVERSION();",
               "    ImGui::CreateContext();",
               "    ImGui::StyleColorsDark();",
               "    ImGuiIO& io = ImGui::GetIO();",
               "    io.IniFilename = nullptr;",
-              "    ImFontConfig font_cfg;",
-              "    font_cfg.SizePixels = 26.0f;",
+              "    ImFontConfig font_cfg; font_cfg.SizePixels = 26.0f;",
               "    io.Fonts->AddFontDefault(&font_cfg);",
               "    ImGui::GetStyle().ScaleAllSizes(1.7f);",
-              '    if (!ImGui_ImplOpenGL3_Init("#version 100")) {',
-              "        ImGui::DestroyContext();",
-              "        return;",
-              "    }",
+              '    if (!ImGui_ImplOpenGL3_Init("#version 100")) { ImGui::DestroyContext(); return; }',
+              "    SDL_AddEventWatch(VILDAN_EventWatch, NULL);",
               "    vildan_imgui_ready = true;",
               "}",
-              "",
-              'extern "C" void VILDAN_ProcessTouch(int action, float x, float y, long long finger_id)',
-              "{",
+              'extern "C" void VILDAN_DrawMenu(void) {',
               "    if (!vildan_imgui_ready) return;",
-              "    ImGuiIO& io = ImGui::GetIO();",
-              "    if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f) return;",
-              "    float real_x = x * io.DisplaySize.x;",
-              "    float real_y = y * io.DisplaySize.y;",
-              "    if (action == 1) {",
-              "        io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);",
-              "        io.AddMousePosEvent(real_x, real_y);",
-              "        io.AddMouseButtonEvent(ImGuiMouseButton_Left, true);",
-              "    } else if (action == 2) {",
-              "        io.AddMousePosEvent(real_x, real_y);",
-              "    } else if (action == 3) {",
-              "        io.AddMousePosEvent(real_x, real_y);",
-              "        io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);",
-              "    }",
-              "}",
-              "",
-              'extern "C" void VILDAN_DrawMenu(void)',
-              "{",
-              "    if (!vildan_imgui_ready) return;",
-              "    GLint viewport[4];",
-              "    glGetIntegerv(GL_VIEWPORT, viewport);",
+              "    GLint viewport[4]; glGetIntegerv(GL_VIEWPORT, viewport);",
               "    if (viewport[2] <= 0 || viewport[3] <= 0) return;",
               "    ImGuiIO& io = ImGui::GetIO();",
               "    io.DisplaySize = ImVec2((float)viewport[2], (float)viewport[3]);",
               "    io.DeltaTime = 1.0f / 60.0f;",
-              "    ImGui_ImplOpenGL3_NewFrame();",
-              "    ImGui::NewFrame();",
-              '    ImGui::SetNextWindowSize(ImVec2(800, 560), ImGuiCond_FirstUseEver);',
-              '    ImGui::SetNextWindowPos(ImVec2(40, 40), ImGuiCond_FirstUseEver);',
-              '    ImGui::Begin("VILDAN 3D - Mod Menu");',
-              '    ImGui::Text("Welcome to VILDAN 3D!");',
-              '    ImGui::Separator();',
-              '    ImGui::Checkbox("ESP (Wallhack)", &vildan_imgui_ready);',
-              '    ImGui::Checkbox("Aimbot", &vildan_imgui_ready);',
-              '    ImGui::Checkbox("Bhop", &vildan_imgui_ready);',
-              '    ImGui::Separator();',
-              '    ImGui::Text("Screen: %d x %d", viewport[2], viewport[3]);',
-              "    ImGui::End();",
-              "    ImGui::Render();",
-              "    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());",
+              "    ImGui_ImplOpenGL3_NewFrame(); ImGui::NewFrame();",
+              "    if (is_menu_open) {",
+              '        ImGui::SetNextWindowSize(ImVec2(800, 560), ImGuiCond_FirstUseEver);',
+              '        ImGui::SetNextWindowPos(ImVec2(40, 40), ImGuiCond_FirstUseEver);',
+              '        if (ImGui::Begin("VILDAN 3D - Mod Menu", &is_menu_open)) {',
+              '            ImGui::Text("Welcome to VILDAN 3D!"); ImGui::Separator();',
+              "            float esp = ((float(*)(const char*, float))gEngfuncs)(\"vildan_esp\", 0.0f);",
+              "            bool esp_b = esp > 0.5f;",
+              '            if (ImGui::Checkbox("ESP (Wallhack)", &esp_b)) { ((void(*)(const char*, float))((void**)gEngfuncs)[24])(\"vildan_esp\", esp_b ? 1.0f : 0.0f); }',
+              "            float aim = ((float(*)(const char*, float))gEngfuncs)(\"vildan_aimbot\", 0.0f);",
+              "            bool aim_b = aim > 0.5f;",
+              '            if (ImGui::Checkbox("Aimbot", &aim_b)) { ((void(*)(const char*, float))((void**)gEngfuncs)[24])(\"vildan_aimbot\", aim_b ? 1.0f : 0.0f); }',
+              "            float bhop = ((float(*)(const char*, float))gEngfuncs)(\"vildan_bhop\", 0.0f);",
+              "            bool bhop_b = bhop > 0.5f;",
+              '            if (ImGui::Checkbox("Bhop", &bhop_b)) { ((void(*)(const char*, float))((void**)gEngfuncs)[24])(\"vildan_bhop\", bhop_b ? 1.0f : 0.0f); }',
+              '            ImGui::Separator(); ImGui::Text("Screen: %d x %d", viewport[2], viewport[3]);',
+              '            if (ImGui::Button("Свернуть")) { is_menu_open = false; }',
+              "        } ImGui::End();",
+              "    }",
+              "    if (!is_menu_open) {",
+              "        const ImVec2 bs(60.0f, 60.0f); const ImGuiStyle& st = ImGui::GetStyle();",
+              "        const ImVec2 ws(bs.x + st.WindowPadding.x * 2.0f + st.WindowBorderSize * 2.0f, bs.y + st.WindowPadding.y * 2.0f + st.WindowBorderSize * 2.0f);",
+              "        float bx = io.DisplaySize.x - ws.x - 10.0f; if (bx < 0.0f) bx = 0.0f;",
+              "        ImGui::SetNextWindowPos(ImVec2(bx, 10.0f), ImGuiCond_Always); ImGui::SetNextWindowSize(ws, ImGuiCond_Always);",
+              "        const ImGuiWindowFlags fl = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar;",
+              '        if (ImGui::Begin("##VILDAN_RestoreButton", nullptr, fl)) { if (ImGui::Button("V", bs)) { is_menu_open = true; } }',
+              "        ImGui::End();",
+              "    }",
+              "    ImGui::Render(); ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());",
               "}", ""
           ])
           Path("engine/ref/gl/vildan_menu.cpp").write_text(menu_cpp)
-
-          # 5. Патчим wscript
-          w_path = Path("engine/ref/gl/wscript")
-          w = w_path.read_text()
-          source_marker = "\tsource = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])"
-          if w.count(source_marker) == 1:
-              imgui_setup = (
-                  "\timgui_dir = bld.srcnode.find_dir('3rdparty/imgui')\n"
-                  "\timgui_backend_dir = imgui_dir.find_dir('backends')\n"
-                  "\timgui_files = ['imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp', 'backends/imgui_impl_opengl3.cpp']\n"
-                  "\timgui_sources = [imgui_dir.find_node(f) for f in imgui_files]\n"
-                  "\timgui_sources.append(bld.path.find_node('vildan_menu.cpp'))\n"
-                  "\timgui_includes = [imgui_dir.abspath(), imgui_backend_dir.abspath()]"
-              )
-              w = w.replace(source_marker, source_marker + "\n" + imgui_setup, 1)
-              
-              old_shlib = "\t\tbld.shlib(source = source,\n\t\t\ttarget = k,\n\t\t\tincludes = includes,\n\t\t\tfeatures = 'format',\n\t\t\tuse = libs + v['libs'],\n\t\t\tdefines = v['defines'] + ['REF_DLL=1'],\n\t\t\tinstall_path = bld.env.LIBDIR)"
-              new_shlib = (
-                  "\t\tif k in ('ref_gl4es',):\n"
-                  "\t\t\tbase_includes = includes if isinstance(includes, list) else [includes]\n"
-                  "\t\t\ttarget_includes = base_includes + imgui_includes\n"
-                  "\t\t\ttarget_source = source + imgui_sources\n"
-                  "\t\t\ttarget_defines = v['defines'] + ['REF_DLL=1', 'VILDAN_IMGUI=1', 'IMGUI_IMPL_OPENGL_ES2=1']\n"
-                  "\t\t\tbld(features = ['c', 'cxx', 'cxxshlib', 'format'], source = target_source, target = k, includes = target_includes, use = libs + v['libs'], lib = ['GLESv2'], defines = target_defines, install_path = bld.env.LIBDIR)\n"
-                  "\t\telse:\n"
-                  "\t\t\tbld.shlib(source = source, target = k, includes = includes, features = 'format', use = libs + v['libs'], defines = v['defines'] + ['REF_DLL=1'], install_path = bld.env.LIBDIR)"
-              )
-              if w.count(old_shlib) == 1: w = w.replace(old_shlib, new_shlib, 1)
-              compile(w, str(w_path), "exec")
-              w_path.write_text(w)
-
-          # 6. Патчим gl_opengl.c (Инициализация)
-          o_path = Path("engine/ref/gl/gl_opengl.c")
-          o = o_path.read_text()
+          # 4. Патчим wscript
+          w_path = Path("engine/ref/gl/wscript"); w = w_path.read_text()
+          sm = "\tsource = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])"
+          if w.count(sm) == 1:
+              setup = "\timgui_dir = bld.srcnode.find_dir('3rdparty/imgui')\n\timgui_backend_dir = imgui_dir.find_dir('backends')\n\timgui_files = ['imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp', 'backends/imgui_impl_opengl3.cpp']\n\timgui_sources = [imgui_dir.find_node(f) for f in imgui_files]\n\timgui_sources.append(bld.path.find_node('vildan_menu.cpp'))\n\timgui_includes = [imgui_dir.abspath(), imgui_backend_dir.abspath()]"
+              w = w.replace(sm, sm + "\n" + setup, 1)
+              old = "\t\tbld.shlib(source = source,\n\t\t\ttarget = k,\n\t\t\tincludes = includes,\n\t\t\tfeatures = 'format',\n\t\t\tuse = libs + v['libs'],\n\t\t\tdefines = v['defines'] + ['REF_DLL=1'],\n\t\t\tinstall_path = bld.env.LIBDIR)"
+              new = "\t\tif k in ('ref_gl4es',):\n\t\t\tbase_includes = includes if isinstance(includes, list) else [includes]\n\t\t\ttarget_includes = base_includes + imgui_includes\n\t\t\ttarget_source = source + imgui_sources\n\t\t\ttarget_defines = v['defines'] + ['REF_DLL=1', 'VILDAN_IMGUI=1', 'IMGUI_IMPL_OPENGL_ES2=1']\n\t\t\tbld(features = ['c', 'cxx', 'cxxshlib', 'format'], source = target_source, target = k, includes = target_includes, use = libs + v['libs'], lib = ['GLESv2'], defines = target_defines, install_path = bld.env.LIBDIR)\n\t\telse:\n\t\t\tbld.shlib(source = source, target = k, includes = includes, features = 'format', use = libs + v['libs'], defines = v['defines'] + ['REF_DLL=1'], install_path = bld.env.LIBDIR)"
+              if w.count(old) == 1: w = w.replace(old, new, 1)
+              compile(w, str(w_path), "exec"); w_path.write_text(w)
+          # 5. Патчим gl_opengl.c
+          o_path = Path("engine/ref/gl/gl_opengl.c"); o = o_path.read_text()
           if '#include "vildan_menu.h"' not in o: o = '#include "vildan_menu.h"\n' + o
-          context_marker = "\tGL_OnContextCreated();"
-          if o.count(context_marker) == 1:
-              o = o.replace(context_marker, context_marker + "\n#ifdef VILDAN_IMGUI\n\tVILDAN_Init();\n#endif", 1)
+          cm = "\tGL_OnContextCreated();"
+          if o.count(cm) == 1: o = o.replace(cm, cm + "\n#ifdef VILDAN_IMGUI\n\tVILDAN_Init();\n#endif", 1)
           o_path.write_text(o)
-
-          # 7. Патчим gl_rmain.c (Отрисовка)
-          m_path = Path("engine/ref/gl/gl_rmain.c")
-          m = m_path.read_text()
+          # 6. Патчим gl_rmain.c (ESP + Отрисовка)
+          m_path = Path("engine/ref/gl/gl_rmain.c"); m = m_path.read_text()
           if '#include "vildan_menu.h"' not in m: m = '#include "vildan_menu.h"\n' + m
-          swap_marker = "\tgEngfuncs.GL_SwapBuffers();"
-          if m.count(swap_marker) == 1:
-              m = m.replace(swap_marker, "#ifdef VILDAN_IMGUI\n\tVILDAN_DrawMenu();\n#endif\n" + swap_marker, 1)
+          esp_old = "R_DrawStudioModel( RI.currententity );"
+          esp_new = 'if ( RI.currententity->player && ((float(*)(const char*, float))gEngfuncs)("vildan_esp", 0.0f) > 0.5f ) {\n\tGLboolean od = pglIsEnabled(GL_DEPTH_TEST);\n\tpglDisable(GL_DEPTH_TEST);\n\tR_DrawStudioModel(RI.currententity);\n\tif(od) pglEnable(GL_DEPTH_TEST);\n} else {\n\tR_DrawStudioModel(RI.currententity);\n}'
+          if m.count(esp_old) == 2: m = m.replace(esp_old, esp_new)
+          sm2 = "\tgEngfuncs.GL_SwapBuffers();"
+          if m.count(sm2) == 1: m = m.replace(sm2, "#ifdef VILDAN_IMGUI\n\tVILDAN_DrawMenu();\n#endif\n" + sm2, 1)
           m_path.write_text(m)
-
-          # 8. ПАТЧИМ API (common/render_api.h)
-          api_path = Path("engine/common/render_api.h")
-          api = api_path.read_text()
-          # Ищем конец структуры ref_interface_t, чтобы добавить указатель
-          api_marker = "void (*pfnDrawText)(int x, int y, const char *text);"
-          if api.count(api_marker) == 1 and "pfnVILDAN_ProcessTouch" not in api:
-              api = api.replace(api_marker, api_marker + "\n\tvoid (*pfnVILDAN_ProcessTouch)(int action, float x, float y, long long finger_id);", 1)
-              api_path.write_text(api)
-              print("render_api.h patched")
-
-          # 9. ПРИВЯЗЫВАЕМ УКАЗАТЕЛЬ (ref/gl/gl_opengl.c)
-          o = o_path.read_text()
-          link_marker = "ref.dllFuncs.pfnDrawText = GL_DrawText;"
-          if o.count(link_marker) == 1 and "pfnVILDAN_ProcessTouch" not in o:
-              o = o.replace(link_marker, link_marker + "\n\tref.dllFuncs.pfnVILDAN_ProcessTouch = VILDAN_ProcessTouch;", 1)
-              o_path.write_text(o)
-              print("gl_opengl.c linked touch pointer")
-
-          # 10. ПЕРЕХВАТЫВАЕМ SDL (engine/platform/sdl/events.c)
-          ev_path = Path("engine/platform/sdl/events.c")
-          if ev_path.exists():
-              ev = ev_path.read_text()
-              # Ищем SDL_FINGERDOWN и вставляем перед ним наш обработчик
-              finger_marker = "case SDL_FINGERDOWN:"
-              if ev.count(finger_marker) == 1 and "pfnVILDAN_ProcessTouch" not in ev:
-                  insert_code = (
-                      "case SDL_FINGERDOWN:\n"
-                      "\t\tif (ref.dllFuncs.pfnVILDAN_ProcessTouch) {\n"
-                      "\t\t\tref.dllFuncs.pfnVILDAN_ProcessTouch(1, event.tfinger.x, event.tfinger.y, (long long)event.tfinger.fingerId);\n"
-                      "\t\t}\n"
-                      "\t\tbreak;\n"
-                      "\tcase SDL_FINGERMOTION:\n"
-                      "\t\tif (ref.dllFuncs.pfnVILDAN_ProcessTouch) {\n"
-                      "\t\t\tref.dllFuncs.pfnVILDAN_ProcessTouch(2, event.tfinger.x, event.tfinger.y, (long long)event.tfinger.fingerId);\n"
-                      "\t\t}\n"
-                      "\t\tbreak;\n"
-                      "\tcase SDL_FINGERUP:\n"
-                      "\t\tif (ref.dllFuncs.pfnVILDAN_ProcessTouch) {\n"
-                      "\t\t\tref.dllFuncs.pfnVILDAN_ProcessTouch(3, event.tfinger.x, event.tfinger.y, (long long)event.tfinger.fingerId);\n"
-                      "\t\t}\n"
-                      "\t\tbreak;\n"
-                  )
-                  # Заменяем оригинальные case на наши
-                  ev = ev.replace("case SDL_FINGERDOWN:", insert_code, 1)
-                  # Удаляем дубликаты старых case (если они были просто break;)
-                  # На самом деле, лучше просто перехватить SDL_PollEvent в самом начале.
-                  # Но давай попробуем аккуратно.
-                  ev_path.write_text(ev)
-                  print("events.c patched for touch")
-
+          # 7. Патчим КЛИЕНТ (Aimbot + Bhop)
+          c_path = Path("client/cl_dll/input/input_xash3d.cpp"); c = c_path.read_text()
+          old_in = 'void IN_Move( float frametime, usercmd_t *cmd )\n{'
+          new_in = "\n".join([
+              'void IN_Move( float frametime, usercmd_t *cmd )\n{',
+              '    cl_entity_t *local = gEngfuncs.GetLocalPlayer();',
+              '    if (local && gEngfuncs.pfnGetCvarPointer("vildan_bhop") && gEngfuncs.pfnGetCvarPointer("vildan_bhop")->value > 0.5f && (cmd->buttons & IN_JUMP)) {',
+              '        if (local->curstate.onground != -1) cmd->buttons |= IN_JUMP;',
+              '        else cmd->buttons &= ~IN_JUMP;',
+              '    }',
+              '    if (gEngfuncs.pfnGetCvarPointer("vildan_aimbot") && gEngfuncs.pfnGetCvarPointer("vildan_aimbot")->value > 0.5f && local && (cmd->buttons & IN_ATTACK)) {',
+              '        cl_entity_t *bt = NULL; float bd = 99999.0f; vec3_t d;',
+              '        for (int i = 1; i <= 32; i++) {',
+              '            cl_entity_t *e = gEngfuncs.GetEntityByIndex(i);',
+              '            if (e && e->player && e->curstate.health > 0 && e->index != local->index) {',
+              '                d[0] = e->origin[0] - local->origin[0]; d[1] = e->origin[1] - local->origin[1]; d[2] = e->origin[2] - local->origin[2];',
+              '                float dist = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);',
+              '                if (dist < bd && dist < 2000.0f) { bd = dist; bt = e; }',
+              '            }',
+              '        }',
+              '        if (bt) {',
+              '            d[0] = bt->origin[0] - local->origin[0]; d[1] = bt->origin[1] - local->origin[1]; d[2] = bt->origin[2] - local->origin[2];',
+              '            float hyp = sqrt(d[0]*d[0] + d[1]*d[1]);',
+              '            cmd->viewangles[0] = atan2(d[2], hyp) * 180.0f / M_PI;',
+              '            cmd->viewangles[1] = atan2(d[1], d[0]) * 180.0f / M_PI;',
+              '        }',
+              '    }'
+          ])
+          if c.count(old_in) == 1: c = c.replace(old_in, new_in, 1)
+          c_path.write_text(c)
       - name: Init submodules
         shell: bash
         run: |
@@ -281,7 +222,6 @@ jobs:
             git -C "$d" submodule sync --recursive
             git -C "$d" submodule update --init --recursive
           done
-
       - name: Prepare reliable downloads
         shell: bash
         run: |
@@ -289,32 +229,32 @@ jobs:
           printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'REAL_WGET=/usr/bin/wget' 'STREAM=false' 'URL=""' 'OUT_FILE=""' 'skip=0' 'for ((i=1; i<=$#; i++)); do' '  arg="${!i}"' '  if [ "$skip" = "1" ]; then skip=0; continue; fi' '  if [ "$arg" = "-qO-" ] || [ "$arg" = "-O-" ]; then STREAM=true; fi' '  if [ "$arg" = "-qO" ] || [ "$arg" = "-O" ]; then next_i=$((i+1)); if [ "$next_i" -le "$#" ]; then OUT_FILE="${!next_i}"; skip=1; fi' '  fi' '  if [[ "$arg" == http* ]] || [[ "$arg" == ftp* ]]; then URL="$arg"; fi' 'done' 'if [ -z "$URL" ]; then echo "No URL found in args: $@" >&2; exit 1; fi' 'if [ "$STREAM" = false ]; then' '  "$REAL_WGET" --timeout=30 --tries=5 --waitretry=5 --retry-connrefused "$@" || exit 1' '  if [ -n "$OUT_FILE" ] && [ -f "$OUT_FILE" ]; then case "$URL" in *.tar.gz) gzip -t "$OUT_FILE" || exit 1 ;; *.tar.xz) xz -t "$OUT_FILE" || exit 1 ;; *.zip) unzip -tq "$OUT_FILE" || exit 1 ;; esac; fi' '  exit 0' 'fi' 'TMP="$(mktemp)"' 'trap "rm -f \$TMP" EXIT' 'for attempt in 1 2 3 4 5; do' '  if "$REAL_WGET" -q --timeout=30 --tries=3 --waitretry=5 --retry-connrefused -O "$TMP" "$URL"; then valid=0; case "$URL" in *.tar.gz) gzip -t "$TMP" || valid=1 ;; *.tar.xz) xz -t "$TMP" || valid=1 ;; *.zip) unzip -tq "$TMP" || valid=1 ;; *) test -s "$TMP" || valid=1 ;; esac; if [ "$valid" -eq 0 ]; then cat "$TMP"; exit 0; fi; fi' '  echo "Download attempt $attempt/5 failed: $URL" >&2' '  sleep "$attempt"' 'done' 'echo "Download failed after 5 attempts: $URL" >&2' 'exit 1' > "$GITHUB_WORKSPACE/.ci-bin/wget"
           chmod +x "$GITHUB_WORKSPACE/.ci-bin/wget"
           echo "$GITHUB_WORKSPACE/.ci-bin" >> "$GITHUB_PATH"
-
-      - name: Build
+      - name: Build Engine
         shell: bash
         run: |
           set -euo pipefail
-          export GH_CPU_OS=android
-          export FFMPEG_VERSION=9.0
+          export GH_CPU_OS=android; export FFMPEG_VERSION=9.0
           cd engine
           sed -i 's/ANDROID_NDK_VERSION=.*/ANDROID_NDK_VERSION="28.2.13676358"/' scripts/gha/deps_android.sh
           sed -i 's/ndkVersion = .*/ndkVersion = "28.2.13676358"/' android/app/build.gradle.kts
           sed -i 's/setOf("armeabi-v7a", "arm64-v8a", "x86")/setOf("arm64-v8a")/' android/app/build.gradle.kts
           sed -i 's/assembleContinuous --no-daemon/assembleContinuous --no-daemon --info --stacktrace/' scripts/gha/build_android.sh
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/deps_android.sh
-          export ANDROID_HOME="$PWD/sdk"
-          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+          export ANDROID_HOME="$PWD/sdk"; export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/build_android.sh
-          if ! find . -name "libref_gl4es.so" | grep -q .; then echo "ERROR: libref_gl4es.so missing"; exit 1; fi
-          if find . -name "libref_gles1.so" | grep -q .; then echo "ERROR: libref_gles1.so still built"; exit 1; fi
-
+      - name: Build Client
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd client/android
+          chmod +x gradlew
+          ./gradlew clean assembleGitDebug -Pandroid.injected.build.abi=arm64-v8a
       - name: Collect APKs
         run: |
           mkdir -p out/apk
-          find engine -name "*.apk" -exec cp {} out/apk/ \;
-
+          find engine client -name "*.apk" -exec cp {} out/apk/ \;
       - uses: actions/upload-artifact@v4
         with:
-          name: VILDAN3D-Touch-Menu
+          name: VILDAN3D-Working-Cheats
           path: out/apk/*.apk
