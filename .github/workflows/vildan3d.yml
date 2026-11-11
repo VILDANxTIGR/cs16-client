@@ -15,7 +15,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout Engine
         uses: actions/checkout@v4
@@ -27,29 +27,36 @@ jobs:
         with: { distribution: temurin, java-version: '21' }
 
       - name: Install deps
-        timeout-minutes: 10
+        timeout-minutes: 20
+        shell: bash
         run: |
           set -euo pipefail
 
-          APT_OPTS=(-o Acquire::Retries=1
-                    -o Acquire::http::Timeout=20
-                    -o Acquire::https::Timeout=20)
+          APT_OPTS=(
+            -o Acquire::Retries=3
+            -o Acquire::http::Timeout=30
+            -o Acquire::https::Timeout=30
+          )
 
-          for i in 1 2 3 4 5; do
-            echo "APT attempt $i/5"
+          for i in 1 2 3 4 5 6; do
+            echo "APT attempt $i/6"
 
             if sudo apt-get "${APT_OPTS[@]}" update &&
-               sudo apt-get "${APT_OPTS[@]}" install -y --no-install-recommends cmake ninja-build unzip; then
+               sudo apt-get "${APT_OPTS[@]}" install -y \
+                 --no-install-recommends \
+                 cmake ninja-build unzip; then
               echo "APT dependencies installed successfully"
               break
             fi
 
-            if [ "$i" -eq 5 ]; then
-              echo "::error::APT failed after 5 attempts"
+            if [ "$i" -eq 6 ]; then
+              echo "::error::APT failed after 6 attempts"
               exit 1
             fi
 
-            sleep $((i * 5))
+            delay=$((i * 10))
+            echo "APT failed; retrying in ${delay}s..."
+            sleep "$delay"
           done
 
           SM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
