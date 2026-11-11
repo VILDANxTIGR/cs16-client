@@ -48,33 +48,17 @@ jobs:
 
           if [ "${#missing[@]}" -ne 0 ]; then
             echo "Missing packages: ${missing[*]}. Attempting to install..."
-
-            APT_OPTS=(
-              -o Acquire::Retries=3
-              -o Acquire::http::Timeout=30
-              -o Acquire::https::Timeout=30
-            )
-
-            sudo sed -i \
-              's/azure.archive.ubuntu.com/archive.ubuntu.com/g' \
-              /etc/apt/sources.list.d/ubuntu.sources || true
-
+            APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+            sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/g' /etc/apt/sources.list.d/ubuntu.sources || true
             apt_ok=false
-
             for i in 1 2 3; do
               echo "APT attempt $i/3"
-
-              if sudo apt-get "${APT_OPTS[@]}" update &&
-                 sudo apt-get install -y --no-install-recommends "${missing[@]}"; then
+              if sudo apt-get "${APT_OPTS[@]}" update && sudo apt-get install -y --no-install-recommends "${missing[@]}"; then
                 apt_ok=true
                 break
               fi
-
-              if [ "$i" -lt 3 ]; then
-                sleep 5
-              fi
+              if [ "$i" -lt 3 ]; then sleep 5; fi
             done
-
             if [ "$apt_ok" != true ]; then
               echo "::error::APT failed to install required packages"
               exit 1
@@ -95,20 +79,12 @@ jobs:
           unzip -v | head -n 2
 
           SM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-
           if [ ! -x "$SM" ]; then
             echo "::error::sdkmanager not found or not executable: $SM"
             exit 1
           fi
-
           yes | "$SM" --licenses > /dev/null || true
-
-          "$SM" --install \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;36.0.0" \
-            "ndk;${NDK_VERSION}"
-
+          "$SM" --install "platform-tools" "platforms;android-35" "build-tools;36.0.0" "ndk;${NDK_VERSION}"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
 
       - name: Setup ImGui
@@ -116,17 +92,51 @@ jobs:
           mkdir -p engine/3rdparty
           git clone --depth 1 https://github.com/ocornut/imgui.git engine/3rdparty/imgui
 
-      - name: Patch Engine for ImGui
-        shell: python {0}
+      - name: Patch Engine for ImGui and configure-ninja.py
+        shell: python3 {0}
         run: |
           import os
+          from pathlib import Path
 
+          # 1. Патчим configure-ninja.py
+          p = Path("engine/scripts/configure-ninja.py")
+          s = p.read_text()
+
+          old_cmake = "\tcmake_process.communicate()"
+          new_cmake = (
+              "\tcmake_process.communicate()\n"
+              "\tif cmake_process.returncode != 0:\n"
+              "\t\traise SystemExit('CMake configuration failed')"
+          )
+          if s.count(old_cmake) != 1:
+              raise RuntimeError("Could not find CMake process marker")
+          s = s.replace(old_cmake, new_cmake, 1)
+
+          old_waf = "\tprocess.communicate()\n\n\twith io.open"
+          new_waf = (
+              "\tprocess.communicate()\n"
+              "\tif process.returncode != 0:\n"
+              "\t\traise SystemExit('Waf configuration failed')\n\n"
+              "\tbuild_ninja = os.path.join(out_path, 'build.ninja')\n"
+              "\tif not os.path.isfile(build_ninja):\n"
+              "\t\traise SystemExit('Waf did not create: ' + build_ninja)\n\n"
+              "\twith io.open"
+          )
+          if s.count(old_waf) != 1:
+              raise RuntimeError("Could not find Waf process marker")
+          s = s.replace(old_waf, new_waf, 1)
+
+          p.write_text(s)
+          print("configure-ninja.py: error checks added")
+
+          # 2. Создаем файлы ImGui с принудительным GLES2
           header_cpp = "#pragma once\n#ifdef __cplusplus\nextern \"C\" {\n#endif\nvoid VILDAN_Init(void);\nvoid VILDAN_DrawMenu(void);\n#ifdef __cplusplus\n}\n#endif\n"
           with open("engine/ref/gl/vildan_menu.h", "w") as f:
               f.write(header_cpp)
 
           menu_cpp = (
               '#include "vildan_menu.h"\n'
+              '#define IMGUI_IMPL_OPENGL_ES2\n'
               '#include "imgui.h"\n'
               '#include "imgui_impl_opengl3.h"\n'
               'extern "C" void VILDAN_Init(void)\n'
@@ -150,6 +160,7 @@ jobs:
           with open("engine/ref/gl/vildan_menu.cpp", "w") as f:
               f.write(menu_cpp)
 
+          # 3. Патчим wscript с проверкой find_node
           wscript_path = "engine/ref/gl/wscript"
           with open(wscript_path, "r") as f:
               w = f.read()
@@ -158,14 +169,21 @@ jobs:
           if w.count(source_marker) != 1:
               raise RuntimeError("Unexpected source declaration in wscript")
               
-          w = w.replace(
-              source_marker,
+          patch_code = (
               "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])\n"
               "imgui_dir = bld.srcnode.find_dir('3rdparty/imgui')\n"
-              "source += [imgui_dir.find_node('imgui.cpp'), imgui_dir.find_node('imgui_draw.cpp'), imgui_dir.find_node('imgui_tables.cpp'), imgui_dir.find_node('imgui_widgets.cpp'), imgui_dir.find_node('backends/imgui_impl_opengl3.cpp'), bld.path.find_node('vildan_menu.cpp')]\n"
-              "includes = ['.', imgui_dir.abspath(), imgui_dir.find_dir('backends').abspath()]",
-              1
+              "if not imgui_dir:\n"
+              "    bld.fatal('ImGui dir not found')\n"
+              "imgui_files = ['imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp', 'backends/imgui_impl_opengl3.cpp']\n"
+              "for f in imgui_files:\n"
+              "    if not imgui_dir.find_node(f):\n"
+              "        bld.fatal('Missing ImGui file: ' + f)\n"
+              "if not bld.path.find_node('vildan_menu.cpp'):\n"
+              "    bld.fatal('Missing vildan_menu.cpp')\n"
+              "source += [imgui_dir.find_node(f) for f in imgui_files] + [bld.path.find_node('vildan_menu.cpp')]\n"
+              "includes = ['.', imgui_dir.abspath(), imgui_dir.find_dir('backends').abspath()]"
           )
+          w = w.replace(source_marker, patch_code, 1)
           
           if w.count("features = 'format'") != 1:
               raise RuntimeError("Unexpected Waf features declaration")
@@ -174,6 +192,7 @@ jobs:
           with open(wscript_path, "w") as f:
               f.write(w)
 
+          # 4. Патчим gl_opengl.c и gl_rmain.c
           opengl_path = "engine/ref/gl/gl_opengl.c"
           with open(opengl_path, "r") as f:
               o = f.read()
@@ -281,12 +300,17 @@ jobs:
           grep -q 'ndkVersion = "28.2.13676358"' android/app/build.gradle.kts
           
           sed -i 's/setOf("armeabi-v7a", "arm64-v8a", "x86")/setOf("arm64-v8a")/' android/app/build.gradle.kts
+          grep -q 'setOf("arm64-v8a")' android/app/build.gradle.kts || { echo "::error::Could not configure arm64-v8a ABI"; exit 1; }
+          
+          sed -i 's/assembleContinuous --no-daemon/assembleContinuous --no-daemon --info --stacktrace/' scripts/gha/build_android.sh || true
           
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/deps_android.sh
           
           export ANDROID_HOME="$PWD/sdk"
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
-          yes | "$ANDROID_HOME/cmdline-tools/tools/bin/sdkmanager" --install "ndk;28.2.13676358" || true
+          
+          test -f "$ANDROID_NDK_HOME/source.properties"
+          cat "$ANDROID_NDK_HOME/source.properties"
           
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
           
@@ -296,6 +320,12 @@ jobs:
         run: |
           mkdir -p out/apk
           find engine -name "*.apk" -exec cp {} out/apk/ \;
+
+          if ! find out/apk -maxdepth 1 -name "*.apk" -print -quit | grep -q .; then
+            echo "::error::No APK files were generated"
+            exit 1
+          fi
+
           ls -lh out/apk
 
       - uses: actions/upload-artifact@v4
