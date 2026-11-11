@@ -96,10 +96,9 @@ jobs:
         shell: python3 {0}
         run: |
           import os
-          import re
           from pathlib import Path
 
-          # 1. Патчим configure-ninja.py
+          # 1. Проверяем и патчим configure-ninja.py
           p = Path("engine/scripts/configure-ninja.py")
           s = p.read_text()
 
@@ -109,8 +108,10 @@ jobs:
               "\tif cmake_process.returncode != 0:\n"
               "\t\traise SystemExit('CMake configuration failed')"
           )
+
           if s.count(old_cmake) != 1:
-              raise RuntimeError("Could not find CMake process marker")
+              raise RuntimeError("Could not find unique CMake marker")
+
           s = s.replace(old_cmake, new_cmake, 1)
 
           old_waf = "\tprocess.communicate()\n\n\twith io.open"
@@ -123,124 +124,214 @@ jobs:
               "\t\traise SystemExit('Waf did not create: ' + build_ninja)\n\n"
               "\twith io.open"
           )
+
           if s.count(old_waf) != 1:
-              raise RuntimeError("Could not find Waf process marker")
+              raise RuntimeError("Could not find unique Waf marker")
+
           s = s.replace(old_waf, new_waf, 1)
-
           p.write_text(s)
-          print("configure-ninja.py: error checks added")
+          print("configure-ninja.py patched")
 
-          # 2. Создаем файлы ImGui
-          header_cpp = "#pragma once\n#ifdef __cplusplus\nextern \"C\" {\n#endif\nvoid VILDAN_Init(void);\nvoid VILDAN_DrawMenu(void);\n#ifdef __cplusplus\n}\n#endif\n"
-          with open("engine/ref/gl/vildan_menu.h", "w") as f:
-              f.write(header_cpp)
+          # 2. Создаём интерфейс ImGui (БЕЗ ТРОЙНЫХ КАВЫЧЕК)
+          header_lines = [
+              "#pragma once",
+              "#ifdef __cplusplus",
+              'extern "C" {',
+              "#endif",
+              "",
+              "void VILDAN_Init(void);",
+              "void VILDAN_DrawMenu(void);",
+              "",
+              "#ifdef __cplusplus",
+              "}",
+              "#endif",
+              ""
+          ]
+          header = "\n".join(header_lines)
+          Path("engine/ref/gl/vildan_menu.h").write_text(header)
 
-          menu_cpp = (
-              '#include "vildan_menu.h"\n'
-              '#include "imgui.h"\n'
-              '#include "imgui_impl_opengl3.h"\n'
-              'extern "C" void VILDAN_Init(void)\n'
-              '{\n'
-              '    IMGUI_CHECKVERSION();\n'
-              '    ImGui::CreateContext();\n'
-              '    ImGui::StyleColorsDark();\n'
-              '    ImGui_ImplOpenGL3_Init("#version 100");\n'
-              '}\n'
-              'extern "C" void VILDAN_DrawMenu(void)\n'
-              '{\n'
-              '    ImGui_ImplOpenGL3_NewFrame();\n'
-              '    ImGui::NewFrame();\n'
-              '    ImGui::Begin("VILDAN 3D");\n'
-              '    ImGui::Text("Mod Menu Base is Working!");\n'
-              '    ImGui::End();\n'
-              '    ImGui::Render();\n'
-              '    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());\n'
-              '}\n'
-          )
-          with open("engine/ref/gl/vildan_menu.cpp", "w") as f:
-              f.write(menu_cpp)
+          menu_lines = [
+              '#include "vildan_menu.h"',
+              '#include "imgui.h"',
+              '#include "imgui_impl_opengl3.h"',
+              "",
+              "static bool vildan_imgui_ready = false;",
+              "",
+              'extern "C" void VILDAN_Init(void)',
+              "{",
+              "    if (vildan_imgui_ready)",
+              "        return;",
+              "",
+              "    IMGUI_CHECKVERSION();",
+              "    ImGui::CreateContext();",
+              "    ImGui::StyleColorsDark();",
+              "",
+              '    if (!ImGui_ImplOpenGL3_Init("#version 100"))',
+              "    {",
+              "        ImGui::DestroyContext();",
+              "        return;",
+              "    }",
+              "",
+              "    vildan_imgui_ready = true;",
+              "}",
+              "",
+              'extern "C" void VILDAN_DrawMenu(void)',
+              "{",
+              "    if (!vildan_imgui_ready)",
+              "        return;",
+              "",
+              "    ImGui_ImplOpenGL3_NewFrame();",
+              "    ImGui::NewFrame();",
+              "",
+              '    ImGui::Begin("VILDAN 3D");',
+              '    ImGui::Text("Mod Menu Base is Working!");',
+              "    ImGui::End();",
+              "",
+              "    ImGui::Render();",
+              "    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());",
+              "}",
+              ""
+          ]
+          menu_cpp = "\n".join(menu_lines)
+          Path("engine/ref/gl/vildan_menu.cpp").write_text(menu_cpp)
 
-          # 3. Патчим wscript (с безопасным re.subn)
-          wscript_path = "engine/ref/gl/wscript"
-          with open(wscript_path, "r") as f:
-              w = f.read()
-          
-          source_marker = "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])"
+          # 3. Патчим Waf wscript с сохранением табуляции
+          wscript_path = Path("engine/ref/gl/wscript")
+          w = wscript_path.read_text()
+
+          source_marker = "\tsource = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])"
+
           if w.count(source_marker) != 1:
               raise RuntimeError("Unexpected source declaration in wscript")
-              
+
+          imgui_setup = (
+              "\timgui_dir = bld.srcnode.find_dir('3rdparty/imgui')\n"
+              "\tif not imgui_dir:\n"
+              "\t\tbld.fatal('ImGui directory not found')\n"
+              "\timgui_backend_dir = imgui_dir.find_dir('backends')\n"
+              "\tif not imgui_backend_dir:\n"
+              "\t\tbld.fatal('ImGui backends directory not found')\n"
+              "\timgui_files = [\n"
+              "\t\t'imgui.cpp',\n"
+              "\t\t'imgui_draw.cpp',\n"
+              "\t\t'imgui_tables.cpp',\n"
+              "\t\t'imgui_widgets.cpp',\n"
+              "\t\t'backends/imgui_impl_opengl3.cpp',\n"
+              "\t]\n"
+              "\tfor f in imgui_files:\n"
+              "\t\tif not imgui_dir.find_node(f):\n"
+              "\t\t\tbld.fatal('Missing ImGui file: ' + f)\n"
+              "\tif not bld.path.find_node('vildan_menu.cpp'):\n"
+              "\t\tbld.fatal('Missing vildan_menu.cpp')\n"
+              "\timgui_sources = [imgui_dir.find_node(f) for f in imgui_files]\n"
+              "\timgui_sources.append(bld.path.find_node('vildan_menu.cpp'))\n"
+              "\timgui_includes = [imgui_dir.abspath(), imgui_backend_dir.abspath()]"
+          )
+
           w = w.replace(
               source_marker,
-              "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])\n"
-              "imgui_dir = bld.srcnode.find_dir('3rdparty/imgui')\n"
-              "if not imgui_dir: bld.fatal('ImGui dir not found')\n"
-              "imgui_files = ['imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp', 'backends/imgui_impl_opengl3.cpp']\n"
-              "for f in imgui_files:\n"
-              "    if not imgui_dir.find_node(f):\n"
-              "        bld.fatal('Missing ImGui file: ' + f)\n"
-              "if not bld.path.find_node('vildan_menu.cpp'):\n"
-              "    bld.fatal('Missing vildan_menu.cpp')\n"
-              "imgui_sources = [imgui_dir.find_node(f) for f in imgui_files] + [bld.path.find_node('vildan_menu.cpp')]\n"
-              "imgui_includes = [imgui_dir.abspath(), imgui_dir.find_dir('backends').abspath()]",
+              source_marker + "\n" + imgui_setup,
               1
           )
-          
-          # Подменяем создание shlib, чтобы ImGui не попадал в ref_gles1
-          pattern = r"bld\.shlib\(\s*source\s*=\s*source,\s*target\s*=\s*k,\s*includes\s*=\s*includes,\s*features\s*=\s*'format',\s*use\s*=\s*libs\s*\+\s*v\['libs'\],\s*defines\s*=\s*v\['defines'\]\s*\+\s*\['REF_DLL=1'\],\s*install_path\s*=\s*bld\.env\.LIBDIR\s*\)"
-          replacement = """if k != 'ref_gles1':
-              target_source = source + imgui_sources
-              base_includes = includes if isinstance(includes, list) else [includes]
-              target_includes = base_includes + ['.'] + imgui_includes
-              target_features = ['c', 'cxx', 'cxxshlib', 'format']
-              target_defines = v['defines'] + ['REF_DLL=1', 'VILDAN_IMGUI=1', 'IMGUI_IMPL_OPENGL_ES2=1']
-          else:
-              target_source = source
-              target_includes = includes
-              target_features = 'format'
-              target_defines = v['defines'] + ['REF_DLL=1']
-          
-          bld.shlib(
-              source = target_source,
-              target = k,
-              includes = target_includes,
-              features = target_features,
-              use = libs + v['libs'],
-              defines = target_defines,
-              install_path = bld.env.LIBDIR
-          )"""
-          
-          w, count = re.subn(pattern, replacement, w)
-          if count != 1:
-              raise RuntimeError("Expected to patch exactly one bld.shlib call, patched {}".format(count))
 
-          with open(wscript_path, "w") as f:
-              f.write(w)
+          # Исходный блок из upstream wscript
+          old_shlib = (
+              "\t\tbld.shlib(source = source,\n"
+              "\t\t\ttarget = k,\n"
+              "\t\t\tincludes = includes,\n"
+              "\t\t\tfeatures = 'format',\n"
+              "\t\t\tuse = libs + v['libs'],\n"
+              "\t\t\tdefines = v['defines'] + ['REF_DLL=1'],\n"
+              "\t\t\tinstall_path = bld.env.LIBDIR)"
+          )
 
-          # 4. Патчим gl_opengl.c и gl_rmain.c с #ifdef
-          opengl_path = "engine/ref/gl/gl_opengl.c"
-          with open(opengl_path, "r") as f:
-              o = f.read()
+          # ImGui добавляем только в GLES2-совместимые Android renderer.
+          new_shlib = (
+              "\t\tif k in ('ref_gl4es', 'ref_gles3compat'):\n"
+              "\t\t\tbase_includes = includes if isinstance(includes, list) else [includes]\n"
+              "\t\t\ttarget_includes = base_includes + imgui_includes\n"
+              "\t\t\ttarget_source = source + imgui_sources\n"
+              "\t\t\ttarget_defines = v['defines'] + [\n"
+              "\t\t\t\t'REF_DLL=1',\n"
+              "\t\t\t\t'VILDAN_IMGUI=1',\n"
+              "\t\t\t\t'IMGUI_IMPL_OPENGL_ES2=1',\n"
+              "\t\t\t]\n"
+              "\t\t\tbld(\n"
+              "\t\t\t\tfeatures = ['c', 'cxx', 'cxxshlib', 'format'],\n"
+              "\t\t\t\tsource = target_source,\n"
+              "\t\t\t\ttarget = k,\n"
+              "\t\t\t\tincludes = target_includes,\n"
+              "\t\t\t\tuse = libs + v['libs'],\n"
+              "\t\t\t\tdefines = target_defines,\n"
+              "\t\t\t\tinstall_path = bld.env.LIBDIR\n"
+              "\t\t\t)\n"
+              "\t\telse:\n"
+              "\t\t\tbld.shlib(source = source,\n"
+              "\t\t\t\ttarget = k,\n"
+              "\t\t\t\tincludes = includes,\n"
+              "\t\t\t\tfeatures = 'format',\n"
+              "\t\t\t\tuse = libs + v['libs'],\n"
+              "\t\t\t\tdefines = v['defines'] + ['REF_DLL=1'],\n"
+              "\t\t\t\tinstall_path = bld.env.LIBDIR)"
+          )
+
+          if w.count(old_shlib) != 1:
+              raise RuntimeError("Could not find exact original bld.shlib block")
+
+          w = w.replace(old_shlib, new_shlib, 1)
+
+          # Проверяем синтаксис до передачи файла Waf
+          compile(w, str(wscript_path), "exec")
+          wscript_path.write_text(w)
+
+          print("wscript patched and Python syntax verified")
+
+          # 4. Подключаем ImGui после инициализации GL-контекста
+          opengl_path = Path("engine/ref/gl/gl_opengl.c")
+          o = opengl_path.read_text()
+
           if '#include "vildan_menu.h"' not in o:
               o = '#include "vildan_menu.h"\n' + o
-          
-          marker = '// see R_ProcessEntData for tr.entities initialization'
-          if marker not in o:
-              raise RuntimeError("R_Init_Video marker not found in gl_opengl.c")
-          o = o.replace(marker, '#ifdef VILDAN_IMGUI\n\tVILDAN_Init();\n#endif\n\n\t' + marker, 1)
-          with open(opengl_path, "w") as f:
-              f.write(o)
 
-          main_path = "engine/ref/gl/gl_rmain.c"
-          with open(main_path, "r") as f:
-              m = f.read()
+          context_marker = "\tGL_OnContextCreated();"
+
+          if o.count(context_marker) != 1:
+              raise RuntimeError("Could not find unique GL_OnContextCreated call")
+
+          o = o.replace(
+              context_marker,
+              context_marker +
+              "\n#ifdef VILDAN_IMGUI\n"
+              "\tVILDAN_Init();\n"
+              "#endif",
+              1
+          )
+
+          opengl_path.write_text(o)
+
+          # 5. Рисуем меню перед SwapBuffers
+          main_path = Path("engine/ref/gl/gl_rmain.c")
+          m = main_path.read_text()
+
           if '#include "vildan_menu.h"' not in m:
               m = '#include "vildan_menu.h"\n' + m
 
-          if 'gEngfuncs.GL_SwapBuffers();' not in m:
-              raise RuntimeError("GL_SwapBuffers not found in gl_rmain.c")
-          m = m.replace('gEngfuncs.GL_SwapBuffers();', '#ifdef VILDAN_IMGUI\n\tVILDAN_DrawMenu();\n#endif\n\tgEngfuncs.GL_SwapBuffers();')
-          with open(main_path, "w") as f:
-              f.write(m)
+          swap_marker = "\tgEngfuncs.GL_SwapBuffers();"
+
+          if m.count(swap_marker) != 1:
+              raise RuntimeError("Expected exactly one GL_SwapBuffers call")
+
+          m = m.replace(
+              swap_marker,
+              "#ifdef VILDAN_IMGUI\n"
+              "\tVILDAN_DrawMenu();\n"
+              "#endif\n" + swap_marker,
+              1
+          )
+
+          main_path.write_text(m)
+
+          print("VILDAN ImGui integration patch completed")
 
       - name: Init submodules
         shell: bash
@@ -291,7 +382,7 @@ jobs:
           '  fi' \
           '  exit 0' \
           'fi' \
-          'URL="$1"' \
+          'URL="${@: -1}"' \
           'TMP="$(mktemp)"' \
           'trap "rm -f \$TMP" EXIT' \
           'for attempt in 1 2 3 4 5; do' \
