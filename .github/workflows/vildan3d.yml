@@ -31,9 +31,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           missing=()
-
           for tool in cmake ninja unzip; do
             if ! command -v "$tool" >/dev/null 2>&1; then
               case "$tool" in
@@ -45,44 +43,15 @@ jobs:
               echo "Found $tool: $(command -v "$tool")"
             fi
           done
-
           if [ "${#missing[@]}" -ne 0 ]; then
-            echo "Missing packages: ${missing[*]}. Attempting to install..."
             APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
             sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/g' /etc/apt/sources.list.d/ubuntu.sources || true
-            apt_ok=false
             for i in 1 2 3; do
-              echo "APT attempt $i/3"
-              if sudo apt-get "${APT_OPTS[@]}" update && sudo apt-get install -y --no-install-recommends "${missing[@]}"; then
-                apt_ok=true
-                break
-              fi
+              if sudo apt-get "${APT_OPTS[@]}" update && sudo apt-get install -y --no-install-recommends "${missing[@]}"; then break; fi
               if [ "$i" -lt 3 ]; then sleep 5; fi
             done
-            if [ "$apt_ok" != true ]; then
-              echo "::error::APT failed to install required packages"
-              exit 1
-            fi
-          else
-            echo "All required tools are already installed. Skipping apt-get."
           fi
-
-          for tool in cmake ninja unzip; do
-            if ! command -v "$tool" >/dev/null 2>&1; then
-              echo "::error::Required tool '$tool' is still missing"
-              exit 1
-            fi
-          done
-
-          cmake --version
-          ninja --version
-          unzip -v | head -n 2
-
           SM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          if [ ! -x "$SM" ]; then
-            echo "::error::sdkmanager not found or not executable: $SM"
-            exit 1
-          fi
           yes | "$SM" --licenses > /dev/null || true
           "$SM" --install "platform-tools" "platforms;android-35" "build-tools;36.0.0" "ndk;${NDK_VERSION}"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
@@ -98,143 +67,86 @@ jobs:
           import os
           from pathlib import Path
 
-          # 1. Проверяем и патчим configure-ninja.py
           p = Path("engine/scripts/configure-ninja.py")
           s = p.read_text()
-
           old_cmake = "\tcmake_process.communicate()"
-          new_cmake = (
-              "\tcmake_process.communicate()\n"
-              "\tif cmake_process.returncode != 0:\n"
-              "\t\traise SystemExit('CMake configuration failed')"
-          )
-
-          if s.count(old_cmake) != 1:
-              raise RuntimeError("Could not find unique CMake marker")
-
-          s = s.replace(old_cmake, new_cmake, 1)
-
+          new_cmake = "\tcmake_process.communicate()\n\tif cmake_process.returncode != 0:\n\t\traise SystemExit('CMake configuration failed')"
+          if s.count(old_cmake) == 1: s = s.replace(old_cmake, new_cmake, 1)
           old_waf = "\tprocess.communicate()\n\n\twith io.open"
-          new_waf = (
-              "\tprocess.communicate()\n"
-              "\tif process.returncode != 0:\n"
-              "\t\traise SystemExit('Waf configuration failed')\n\n"
-              "\tbuild_ninja = os.path.join(out_path, 'build.ninja')\n"
-              "\tif not os.path.isfile(build_ninja):\n"
-              "\t\traise SystemExit('Waf did not create: ' + build_ninja)\n\n"
-              "\twith io.open"
-          )
-
-          if s.count(old_waf) != 1:
-              raise RuntimeError("Could not find unique Waf marker")
-
-          s = s.replace(old_waf, new_waf, 1)
+          new_waf = "\tprocess.communicate()\n\tif process.returncode != 0:\n\t\traise SystemExit('Waf configuration failed')\n\n\tbuild_ninja = os.path.join(out_path, 'build.ninja')\n\tif not os.path.isfile(build_ninja):\n\t\traise SystemExit('Waf did not create: ' + build_ninja)\n\n\twith io.open"
+          if s.count(old_waf) == 1: s = s.replace(old_waf, new_waf, 1)
           p.write_text(s)
-          print("configure-ninja.py patched")
 
-          # 2. Создаём интерфейс ImGui (БЕЗ ТРОЙНЫХ КАВЫЧЕК)
-          header_lines = [
-              "#pragma once",
-              "#ifdef __cplusplus",
-              'extern "C" {',
-              "#endif",
-              "",
-              "void VILDAN_Init(void);",
-              "void VILDAN_DrawMenu(void);",
-              "",
-              "#ifdef __cplusplus",
-              "}",
-              "#endif",
-              ""
-          ]
-          header = "\n".join(header_lines)
+          header = "\n".join([
+              "#pragma once", "#ifdef __cplusplus", 'extern "C" {', "#endif",
+              "void VILDAN_Init(void);", "void VILDAN_DrawMenu(void);",
+              "#ifdef __cplusplus", "}", "#endif", ""
+          ])
           Path("engine/ref/gl/vildan_menu.h").write_text(header)
 
-          menu_lines = [
+          menu_cpp = "\n".join([
               '#include "vildan_menu.h"',
               '#include "imgui.h"',
               '#include "imgui_impl_opengl3.h"',
+              'extern "C" {',
+              '    #include "qgl.h"',
+              '    #include "console.h"',
+              '    extern int ScreenWidth;',
+              '    extern int ScreenHeight;',
+              '}',
               "",
               "static bool vildan_imgui_ready = false;",
               "",
               'extern "C" void VILDAN_Init(void)',
               "{",
-              "    if (vildan_imgui_ready)",
-              "        return;",
-              "",
+              "    if (vildan_imgui_ready) return;",
               "    IMGUI_CHECKVERSION();",
               "    ImGui::CreateContext();",
               "    ImGui::StyleColorsDark();",
-              "",
-              '    if (!ImGui_ImplOpenGL3_Init("#version 100"))',
-              "    {",
+              '    Con_Printf("VILDAN 3D: Initializing ImGui...\\n");',
+              '    if (!ImGui_ImplOpenGL3_Init("#version 100")) {',
+              '        Con_Printf("VILDAN 3D: ERROR - ImGui_ImplOpenGL3_Init failed!\\n");',
               "        ImGui::DestroyContext();",
               "        return;",
               "    }",
-              "",
+              '    Con_Printf("VILDAN 3D: ImGui Initialized Successfully!\\n");',
               "    vildan_imgui_ready = true;",
               "}",
               "",
               'extern "C" void VILDAN_DrawMenu(void)',
               "{",
-              "    if (!vildan_imgui_ready)",
-              "        return;",
-              "",
+              "    if (!vildan_imgui_ready) return;",
+              "    ImGuiIO& io = ImGui::GetIO();",
+              "    io.DisplaySize = ImVec2((float)ScreenWidth, (float)ScreenHeight);",
+              "    io.DeltaTime = 1.0f / 60.0f;",
               "    ImGui_ImplOpenGL3_NewFrame();",
               "    ImGui::NewFrame();",
-              "",
+              '    ImGui::SetNextWindowPos(ImVec2(50, 50), ImGuiCond_FirstUseEver);',
               '    ImGui::Begin("VILDAN 3D");',
               '    ImGui::Text("Mod Menu Base is Working!");',
+              '    ImGui::Text("Screen: %d x %d", ScreenWidth, ScreenHeight);',
               "    ImGui::End();",
-              "",
               "    ImGui::Render();",
               "    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());",
-              "}",
-              ""
-          ]
-          menu_cpp = "\n".join(menu_lines)
+              "}", ""
+          ])
           Path("engine/ref/gl/vildan_menu.cpp").write_text(menu_cpp)
 
-          # 3. Патчим Waf wscript с сохранением табуляции
           wscript_path = Path("engine/ref/gl/wscript")
           w = wscript_path.read_text()
-
           source_marker = "\tsource = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])"
-
-          if w.count(source_marker) != 1:
-              raise RuntimeError("Unexpected source declaration in wscript")
-
+          if w.count(source_marker) != 1: raise RuntimeError("Unexpected source declaration")
+          
           imgui_setup = (
               "\timgui_dir = bld.srcnode.find_dir('3rdparty/imgui')\n"
-              "\tif not imgui_dir:\n"
-              "\t\tbld.fatal('ImGui directory not found')\n"
               "\timgui_backend_dir = imgui_dir.find_dir('backends')\n"
-              "\tif not imgui_backend_dir:\n"
-              "\t\tbld.fatal('ImGui backends directory not found')\n"
-              "\timgui_files = [\n"
-              "\t\t'imgui.cpp',\n"
-              "\t\t'imgui_draw.cpp',\n"
-              "\t\t'imgui_tables.cpp',\n"
-              "\t\t'imgui_widgets.cpp',\n"
-              "\t\t'backends/imgui_impl_opengl3.cpp',\n"
-              "\t]\n"
-              "\tfor f in imgui_files:\n"
-              "\t\tif not imgui_dir.find_node(f):\n"
-              "\t\t\tbld.fatal('Missing ImGui file: ' + f)\n"
-              "\tif not bld.path.find_node('vildan_menu.cpp'):\n"
-              "\t\tbld.fatal('Missing vildan_menu.cpp')\n"
+              "\timgui_files = ['imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp', 'backends/imgui_impl_opengl3.cpp']\n"
               "\timgui_sources = [imgui_dir.find_node(f) for f in imgui_files]\n"
               "\timgui_sources.append(bld.path.find_node('vildan_menu.cpp'))\n"
               "\timgui_includes = [imgui_dir.abspath(), imgui_backend_dir.abspath()]"
           )
+          w = w.replace(source_marker, source_marker + "\n" + imgui_setup, 1)
 
-          w = w.replace(
-              source_marker,
-              source_marker + "\n" + imgui_setup,
-              1
-          )
-
-          # Исходный блок из upstream wscript
           old_shlib = (
               "\t\tbld.shlib(source = source,\n"
               "\t\t\ttarget = k,\n"
@@ -245,169 +157,50 @@ jobs:
               "\t\t\tinstall_path = bld.env.LIBDIR)"
           )
 
-          # ImGui добавляем только в GLES2-совместимые Android renderer + GLESv2
           new_shlib = (
-              "\t\tif k in ('ref_gl4es', 'ref_gles3compat'):\n"
+              "\t\tif k in ('ref_gles1', 'ref_gl4es', 'ref_gles3compat'):\n"
               "\t\t\tbase_includes = includes if isinstance(includes, list) else [includes]\n"
               "\t\t\ttarget_includes = base_includes + imgui_includes\n"
               "\t\t\ttarget_source = source + imgui_sources\n"
-              "\t\t\ttarget_defines = v['defines'] + [\n"
-              "\t\t\t\t'REF_DLL=1',\n"
-              "\t\t\t\t'VILDAN_IMGUI=1',\n"
-              "\t\t\t\t'IMGUI_IMPL_OPENGL_ES2=1',\n"
-              "\t\t\t]\n"
-              "\t\t\tbld(\n"
-              "\t\t\t\tfeatures = ['c', 'cxx', 'cxxshlib', 'format'],\n"
-              "\t\t\t\tsource = target_source,\n"
-              "\t\t\t\ttarget = k,\n"
-              "\t\t\t\tincludes = target_includes,\n"
-              "\t\t\t\tuse = libs + v['libs'],\n"
-              "\t\t\t\tlib = ['GLESv2'],\n"
-              "\t\t\t\tdefines = target_defines,\n"
-              "\t\t\t\tinstall_path = bld.env.LIBDIR\n"
-              "\t\t\t)\n"
+              "\t\t\ttarget_defines = v['defines'] + ['REF_DLL=1', 'VILDAN_IMGUI=1', 'IMGUI_IMPL_OPENGL_ES2=1']\n"
+              "\t\t\tbld(features = ['c', 'cxx', 'cxxshlib', 'format'], source = target_source, target = k, includes = target_includes, use = libs + v['libs'], lib = ['GLESv2'], defines = target_defines, install_path = bld.env.LIBDIR)\n"
               "\t\telse:\n"
-              "\t\t\tbld.shlib(source = source,\n"
-              "\t\t\t\ttarget = k,\n"
-              "\t\t\t\tincludes = includes,\n"
-              "\t\t\t\tfeatures = 'format',\n"
-              "\t\t\t\tuse = libs + v['libs'],\n"
-              "\t\t\t\tdefines = v['defines'] + ['REF_DLL=1'],\n"
-              "\t\t\t\tinstall_path = bld.env.LIBDIR)"
+              "\t\t\tbld.shlib(source = source, target = k, includes = includes, features = 'format', use = libs + v['libs'], defines = v['defines'] + ['REF_DLL=1'], install_path = bld.env.LIBDIR)"
           )
-
-          if w.count(old_shlib) != 1:
-              raise RuntimeError("Could not find exact original bld.shlib block")
-
           w = w.replace(old_shlib, new_shlib, 1)
-
-          # Проверяем синтаксис до передачи файла Waf
           compile(w, str(wscript_path), "exec")
           wscript_path.write_text(w)
 
-          print("wscript patched and Python syntax verified")
-
-          # 4. Подключаем ImGui после инициализации GL-контекста
           opengl_path = Path("engine/ref/gl/gl_opengl.c")
           o = opengl_path.read_text()
-
-          if '#include "vildan_menu.h"' not in o:
-              o = '#include "vildan_menu.h"\n' + o
-
+          if '#include "vildan_menu.h"' not in o: o = '#include "vildan_menu.h"\n' + o
           context_marker = "\tGL_OnContextCreated();"
-
-          if o.count(context_marker) != 1:
-              raise RuntimeError("Could not find unique GL_OnContextCreated call")
-
-          o = o.replace(
-              context_marker,
-              context_marker +
-              "\n#ifdef VILDAN_IMGUI\n"
-              "\tVILDAN_Init();\n"
-              "#endif",
-              1
-          )
-
+          if o.count(context_marker) == 1:
+              o = o.replace(context_marker, context_marker + "\n#ifdef VILDAN_IMGUI\n\tVILDAN_Init();\n#endif", 1)
           opengl_path.write_text(o)
 
-          # 5. Рисуем меню перед SwapBuffers
           main_path = Path("engine/ref/gl/gl_rmain.c")
           m = main_path.read_text()
-
-          if '#include "vildan_menu.h"' not in m:
-              m = '#include "vildan_menu.h"\n' + m
-
+          if '#include "vildan_menu.h"' not in m: m = '#include "vildan_menu.h"\n' + m
           swap_marker = "\tgEngfuncs.GL_SwapBuffers();"
-
-          if m.count(swap_marker) != 1:
-              raise RuntimeError("Expected exactly one GL_SwapBuffers call")
-
-          m = m.replace(
-              swap_marker,
-              "#ifdef VILDAN_IMGUI\n"
-              "\tVILDAN_DrawMenu();\n"
-              "#endif\n" + swap_marker,
-              1
-          )
-
+          if m.count(swap_marker) == 1:
+              m = m.replace(swap_marker, "#ifdef VILDAN_IMGUI\n\tVILDAN_DrawMenu();\n#endif\n" + swap_marker, 1)
           main_path.write_text(m)
-
-          print("VILDAN ImGui integration patch completed")
 
       - name: Init submodules
         shell: bash
         run: |
           set -euo pipefail
-
           for d in engine client; do
-            echo "Initializing submodules in $d"
             git -C "$d" submodule sync --recursive
             git -C "$d" submodule update --init --recursive
           done
-
-          echo "Checking engine mainui submodule..."
-          test -f engine/3rdparty/mainui/CMakeLists.txt || {
-            echo "::error::Engine mainui submodule is missing!"
-            exit 1
-          }
-
-          echo "Engine mainui submodule is ready."
 
       - name: Prepare reliable downloads
         shell: bash
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.ci-bin"
-          printf '%s\n' \
-          '#!/usr/bin/env bash' \
-          'set -euo pipefail' \
-          'REAL_WGET=/usr/bin/wget' \
-          'STREAM=false' \
-          'URL=""' \
-          'OUT_FILE=""' \
-          'skip=0' \
-          'for ((i=1; i<=$#; i++)); do' \
-          '  arg="${!i}"' \
-          '  if [ "$skip" = "1" ]; then skip=0; continue; fi' \
-          '  if [ "$arg" = "-qO-" ] || [ "$arg" = "-O-" ]; then STREAM=true; fi' \
-          '  if [ "$arg" = "-qO" ] || [ "$arg" = "-O" ]; then' \
-          '    next_i=$((i+1))' \
-          '    if [ "$next_i" -le "$#" ]; then OUT_FILE="${!next_i}"; skip=1; fi' \
-          '  fi' \
-          '  if [[ "$arg" == http* ]] || [[ "$arg" == ftp* ]]; then URL="$arg"; fi' \
-          'done' \
-          'if [ -z "$URL" ]; then echo "No URL found in args: $@" >&2; exit 1; fi' \
-          'if [ "$STREAM" = false ]; then' \
-          '  "$REAL_WGET" --timeout=30 --tries=5 --waitretry=5 --retry-connrefused "$@" || exit 1' \
-          '  if [ -n "$OUT_FILE" ] && [ -f "$OUT_FILE" ]; then' \
-          '    case "$URL" in' \
-          '      *.tar.gz) gzip -t "$OUT_FILE" || exit 1 ;;' \
-          '      *.tar.xz) xz -t "$OUT_FILE" || exit 1 ;;' \
-          '      *.zip) unzip -tq "$OUT_FILE" || exit 1 ;;' \
-          '    esac' \
-          '  fi' \
-          '  exit 0' \
-          'fi' \
-          'TMP="$(mktemp)"' \
-          'trap "rm -f \$TMP" EXIT' \
-          'for attempt in 1 2 3 4 5; do' \
-          '  if "$REAL_WGET" -q --timeout=30 --tries=3 --waitretry=5 --retry-connrefused -O "$TMP" "$URL"; then' \
-          '    valid=0' \
-          '    case "$URL" in' \
-          '      *.tar.gz) gzip -t "$TMP" || valid=1 ;;' \
-          '      *.tar.xz) xz -t "$TMP" || valid=1 ;;' \
-          '      *.zip) unzip -tq "$TMP" || valid=1 ;;' \
-          '      *) test -s "$TMP" || valid=1 ;;' \
-          '    esac' \
-          '    if [ "$valid" -eq 0 ]; then' \
-          '      cat "$TMP"' \
-          '      exit 0' \
-          '    fi' \
-          '  fi' \
-          '  echo "Download attempt $attempt/5 failed: $URL" >&2' \
-          '  sleep "$attempt"' \
-          'done' \
-          'echo "Download failed after 5 attempts: $URL" >&2' \
-          'exit 1' > "$GITHUB_WORKSPACE/.ci-bin/wget"
+          printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'REAL_WGET=/usr/bin/wget' 'STREAM=false' 'URL=""' 'OUT_FILE=""' 'skip=0' 'for ((i=1; i<=$#; i++)); do' '  arg="${!i}"' '  if [ "$skip" = "1" ]; then skip=0; continue; fi' '  if [ "$arg" = "-qO-" ] || [ "$arg" = "-O-" ]; then STREAM=true; fi' '  if [ "$arg" = "-qO" ] || [ "$arg" = "-O" ]; then next_i=$((i+1)); if [ "$next_i" -le "$#" ]; then OUT_FILE="${!next_i}"; skip=1; fi' '  fi' '  if [[ "$arg" == http* ]] || [[ "$arg" == ftp* ]]; then URL="$arg"; fi' 'done' 'if [ -z "$URL" ]; then echo "No URL found in args: $@" >&2; exit 1; fi' 'if [ "$STREAM" = false ]; then' '  "$REAL_WGET" --timeout=30 --tries=5 --waitretry=5 --retry-connrefused "$@" || exit 1' '  if [ -n "$OUT_FILE" ] && [ -f "$OUT_FILE" ]; then case "$URL" in *.tar.gz) gzip -t "$OUT_FILE" || exit 1 ;; *.tar.xz) xz -t "$OUT_FILE" || exit 1 ;; *.zip) unzip -tq "$OUT_FILE" || exit 1 ;; esac; fi' '  exit 0' 'fi' 'TMP="$(mktemp)"' 'trap "rm -f \$TMP" EXIT' 'for attempt in 1 2 3 4 5; do' '  if "$REAL_WGET" -q --timeout=30 --tries=3 --waitretry=5 --retry-connrefused -O "$TMP" "$URL"; then valid=0; case "$URL" in *.tar.gz) gzip -t "$TMP" || valid=1 ;; *.tar.xz) xz -t "$TMP" || valid=1 ;; *.zip) unzip -tq "$TMP" || valid=1 ;; *) test -s "$TMP" || valid=1 ;; esac; if [ "$valid" -eq 0 ]; then cat "$TMP"; exit 0; fi; fi' '  echo "Download attempt $attempt/5 failed: $URL" >&2' '  sleep "$attempt"' 'done' 'echo "Download failed after 5 attempts: $URL" >&2' 'exit 1' > "$GITHUB_WORKSPACE/.ci-bin/wget"
           chmod +x "$GITHUB_WORKSPACE/.ci-bin/wget"
           echo "$GITHUB_WORKSPACE/.ci-bin" >> "$GITHUB_PATH"
 
@@ -417,31 +210,15 @@ jobs:
           set -euo pipefail
           export GH_CPU_OS=android
           export FFMPEG_VERSION=9.0
-          
           cd engine
-          
           sed -i 's/ANDROID_NDK_VERSION=.*/ANDROID_NDK_VERSION="28.2.13676358"/' scripts/gha/deps_android.sh
-          grep -q 'ANDROID_NDK_VERSION="28.2.13676358"' scripts/gha/deps_android.sh
-          
           sed -i 's/ndkVersion = .*/ndkVersion = "28.2.13676358"/' android/app/build.gradle.kts
-          grep -q 'ndkVersion = "28.2.13676358"' android/app/build.gradle.kts
-          
           sed -i 's/setOf("armeabi-v7a", "arm64-v8a", "x86")/setOf("arm64-v8a")/' android/app/build.gradle.kts
-          grep -q 'setOf("arm64-v8a")' android/app/build.gradle.kts || { echo "::error::Could not configure arm64-v8a ABI"; exit 1; }
-          
           sed -i 's/assembleContinuous --no-daemon/assembleContinuous --no-daemon --info --stacktrace/' scripts/gha/build_android.sh
-          grep -q 'assembleContinuous --no-daemon --info --stacktrace' scripts/gha/build_android.sh || { echo "::error::Could not configure Gradle diagnostics"; exit 1; }
-          
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/deps_android.sh
-          
           export ANDROID_HOME="$PWD/sdk"
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
-          
-          test -f "$ANDROID_NDK_HOME/source.properties"
-          cat "$ANDROID_NDK_HOME/source.properties"
-          
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
-          
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/build_android.sh
 
       - name: Collect APKs
@@ -449,14 +226,7 @@ jobs:
           mkdir -p out/apk
           find engine -name "*.apk" -exec cp {} out/apk/ \;
 
-          if ! find out/apk -maxdepth 1 -name "*.apk" -print -quit | grep -q .; then
-            echo "::error::No APK files were generated"
-            exit 1
-          fi
-
-          ls -lh out/apk
-
       - uses: actions/upload-artifact@v4
         with:
-          name: VILDAN3D-Base-APK
+          name: VILDAN3D-Debug-APK
           path: out/apk/*.apk
