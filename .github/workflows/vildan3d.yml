@@ -197,20 +197,29 @@ jobs:
           
           cd engine
           
-          sed -i 's/ANDROID_NDK_VERSION="29.0.14206865"/ANDROID_NDK_VERSION="28.2.13676358"/' scripts/gha/deps_android.sh
-          grep -qF 'ANDROID_NDK_VERSION="28.2.13676358"' scripts/gha/deps_android.sh
+          # 1. Гибкая замена версии NDK в скрипте зависимостей
+          sed -i 's/ANDROID_NDK_VERSION=.*/ANDROID_NDK_VERSION="28.2.13676358"/' scripts/gha/deps_android.sh
+          grep -q 'ANDROID_NDK_VERSION="28.2.13676358"' scripts/gha/deps_android.sh
           
-          sed -i 's/ndkVersion = "29.0.14206865"/ndkVersion = "28.2.13676358"/' android/app/build.gradle.kts
-          grep -qF 'ndkVersion = "28.2.13676358"' android/app/build.gradle.kts
+          # 2. Гибкая замена версии NDK в build.gradle.kts (на случай других пробелов)
+          sed -i 's/ndkVersion = .*/ndkVersion = "28.2.13676358"/' android/app/build.gradle.kts
+          grep -q 'ndkVersion = "28.2.13676358"' android/app/build.gradle.kts
           
+          # 3. Ограничиваем ABI
           sed -i 's/setOf("armeabi-v7a", "arm64-v8a", "x86")/setOf("arm64-v8a")/' android/app/build.gradle.kts
           
+          # 4. Запускаем скрипт зависимостей (он установит NDK 28.2.13676358)
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/deps_android.sh
           
+          # 5. Принудительно устанавливаем NDK 28.2.13676358 в локальный SDK (на всякий случай)
           export ANDROID_HOME="$PWD/sdk"
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+          yes | "$ANDROID_HOME/cmdline-tools/tools/bin/sdkmanager" --install "ndk;28.2.13676358" || true
+          
+          # 6. Указываем Gradle путь к SDK (без ndk.dir, как советовал ChatGPT)
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
           
+          # 7. Собираем движок
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/build_android.sh
 
       - name: Collect APKs
