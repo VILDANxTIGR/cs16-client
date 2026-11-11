@@ -77,15 +77,17 @@ jobs:
           with open(wscript_path, "r") as f:
               w = f.read()
           
-          if "source = bld.path.ant_glob" not in w:
-              raise RuntimeError("Could not find source in wscript")
+          source_marker = "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])"
+          if w.count(source_marker) != 1:
+              raise RuntimeError("Unexpected source declaration in wscript")
               
           w = w.replace(
-              "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])",
+              source_marker,
               "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])\n"
               "imgui_dir = bld.srcnode.find_dir('3rdparty/imgui')\n"
               "source += [imgui_dir.find_node('imgui.cpp'), imgui_dir.find_node('imgui_draw.cpp'), imgui_dir.find_node('imgui_tables.cpp'), imgui_dir.find_node('imgui_widgets.cpp'), imgui_dir.find_node('backends/imgui_impl_opengl3.cpp'), bld.path.find_node('vildan_menu.cpp')]\n"
-              "includes = ['.', imgui_dir.abspath(), imgui_dir.find_dir('backends').abspath()]"
+              "includes = ['.', imgui_dir.abspath(), imgui_dir.find_dir('backends').abspath()]",
+              1
           )
           
           if w.count("features = 'format'") != 1:
@@ -144,7 +146,22 @@ jobs:
           '  [ "$arg" = "-qO-" ] && STREAM=true' \
           'done' \
           'if [ "$STREAM" = false ]; then' \
-          '  exec "$REAL_WGET" --timeout=30 --tries=5 --waitretry=5 --retry-connrefused "$@"' \
+          '  OUT_FILE=""' \
+          '  prev=""' \
+          '  for arg in "$@"; do' \
+          '    if [ "$prev" = "-qO" ] || [ "$prev" = "-O" ]; then OUT_FILE="$arg"; fi' \
+          '    prev="$arg"' \
+          '  done' \
+          '  "$REAL_WGET" --timeout=30 --tries=5 --waitretry=5 --retry-connrefused "$@" || exit 1' \
+          '  if [ -n "$OUT_FILE" ] && [ -f "$OUT_FILE" ]; then' \
+          '    URL="${@: -1}"' \
+          '    case "$URL" in' \
+          '      *.tar.gz) gzip -t "$OUT_FILE" || exit 1 ;;' \
+          '      *.tar.xz) xz -t "$OUT_FILE" || exit 1 ;;' \
+          '      *.zip) unzip -tq "$OUT_FILE" || exit 1 ;;' \
+          '    esac' \
+          '  fi' \
+          '  exit 0' \
           'fi' \
           'URL="$1"' \
           'TMP="$(mktemp)"' \
@@ -179,24 +196,21 @@ jobs:
           export FFMPEG_VERSION=9.0
           
           cd engine
-          # Жестко синхронизируем версию NDK в скрипте установки
-          sed -i 's/ANDROID_NDK_VERSION="29.0.14206865"/ANDROID_NDK_VERSION="28.2.13676358"/' scripts/gha/deps_android.sh || true
           
-          # Принудительно ставим правильную версию в build.gradle.kts
-          sed -i 's/ndkVersion = "29.0.14206865"/ndkVersion = "28.2.13676358"/' android/app/build.gradle.kts || true
+          sed -i 's/ANDROID_NDK_VERSION="29.0.14206865"/ANDROID_NDK_VERSION="28.2.13676358"/' scripts/gha/deps_android.sh
+          grep -qF 'ANDROID_NDK_VERSION="28.2.13676358"' scripts/gha/deps_android.sh
           
-          # Ограничиваем ABI
+          sed -i 's/ndkVersion = "29.0.14206865"/ndkVersion = "28.2.13676358"/' android/app/build.gradle.kts
+          grep -qF 'ndkVersion = "28.2.13676358"' android/app/build.gradle.kts
+          
           sed -i 's/setOf("armeabi-v7a", "arm64-v8a", "x86")/setOf("arm64-v8a")/' android/app/build.gradle.kts
           
-          # Запускаем скрипт зависимостей
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/deps_android.sh
           
-          # Указываем переменные окружения и local.properties
           export ANDROID_HOME="$PWD/sdk"
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
-          printf 'sdk.dir=%s\nndk.dir=%s\n' "$ANDROID_HOME" "$ANDROID_NDK_HOME" > android/local.properties
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
           
-          # Собираем движок
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/build_android.sh
 
       - name: Collect APKs
