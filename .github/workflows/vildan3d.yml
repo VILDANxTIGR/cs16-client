@@ -19,10 +19,15 @@ jobs:
     steps:
       - name: Checkout Engine
         uses: actions/checkout@v4
-        with: { repository: '${{ env.ENGINE_REPO }}', path: engine }
+        with:
+          repository: '${{ env.ENGINE_REPO }}'
+          ref: 707596f4905689ec224e993fcaa4d4ad66aa67d6
+          path: engine
+
       - name: Checkout Client
         uses: actions/checkout@v4
         with: { repository: '${{ env.CLIENT_REPO }}', path: client }
+
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '21' }
 
@@ -51,6 +56,12 @@ jobs:
               if [ "$i" -lt 3 ]; then sleep 5; fi
             done
           fi
+          for tool in cmake ninja unzip; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required tool '$tool' is missing"
+              exit 1
+            fi
+          done
           SM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SM" --licenses > /dev/null || true
           "$SM" --install "platform-tools" "platforms;android-35" "build-tools;36.0.0" "ndk;${NDK_VERSION}"
@@ -61,25 +72,38 @@ jobs:
           rm -rf engine/3rdparty/imgui
           git clone --depth 1 --branch v1.90.5 https://github.com/ocornut/imgui.git engine/3rdparty/imgui
 
-      - name: Patch Engine for ImGui and configure-ninja.py
+      - name: Patch Engine for ImGui
         shell: python3 {0}
         run: |
           import os
           from pathlib import Path
 
+          # 1. Строгая проверка configure-ninja.py
           p = Path("engine/scripts/configure-ninja.py")
           s = p.read_text()
           old_cmake = "\tcmake_process.communicate()"
           new_cmake = "\tcmake_process.communicate()\n\tif cmake_process.returncode != 0:\n\t\traise SystemExit('CMake configuration failed')"
-          if s.count(old_cmake) == 1: s = s.replace(old_cmake, new_cmake, 1)
+          if s.count(old_cmake) != 1: raise RuntimeError("CMake marker not found")
+          s = s.replace(old_cmake, new_cmake, 1)
           old_waf = "\tprocess.communicate()\n\n\twith io.open"
           new_waf = "\tprocess.communicate()\n\tif process.returncode != 0:\n\t\traise SystemExit('Waf configuration failed')\n\n\tbuild_ninja = os.path.join(out_path, 'build.ninja')\n\tif not os.path.isfile(build_ninja):\n\t\traise SystemExit('Waf did not create: ' + build_ninja)\n\n\twith io.open"
-          if s.count(old_waf) == 1: s = s.replace(old_waf, new_waf, 1)
+          if s.count(old_waf) != 1: raise RuntimeError("Waf marker not found")
+          s = s.replace(old_waf, new_waf, 1)
           p.write_text(s)
 
+          # 2. Отключаем NanoGL в корневом wscript
+          ew_path = Path("engine/wscript")
+          ew = ew_path.read_text()
+          old_android = "\tif conf.env.DEST_OS == 'android':\n\t\tconf.options.NANOGL           = True\n\t\tconf.options.GLWES            = False # deprecated\n\t\tconf.options.GL4ES            = True\n\t\tconf.options.GLES3COMPAT      = True\n\t\tconf.options.GL               = False\n"
+          new_android = "\tif conf.env.DEST_OS == 'android':\n\t\tconf.options.NANOGL           = False\n\t\tconf.options.GLWES            = False # deprecated\n\t\tconf.options.GL4ES            = True\n\t\tconf.options.GLES3COMPAT      = True\n\t\tconf.options.GL               = False\n"
+          if ew.count(old_android) != 1: raise RuntimeError("Android renderer config not found")
+          ew = ew.replace(old_android, new_android, 1)
+          ew_path.write_text(ew)
+
+          # 3. Создаем файлы ImGui
           header = "\n".join([
               "#pragma once", "#ifdef __cplusplus", 'extern "C" {', "#endif",
-              "void VILDAN_Init(void);", "void VILDAN_DrawMenu(void);",
+              "void VILDAN_Init(void);", "void VILDAN_DrawMenu(int width, int height);",
               "#ifdef __cplusplus", "}", "#endif", ""
           ])
           Path("engine/ref/gl/vildan_menu.h").write_text(header)
@@ -88,9 +112,11 @@ jobs:
               '#include "vildan_menu.h"',
               '#include "imgui.h"',
               '#include "imgui_impl_opengl3.h"',
-              '#include <GLES2/gl2.h>',
               "",
               "static bool vildan_imgui_ready = false;",
+              "static bool esp_enabled = false;",
+              "static bool aimbot_enabled = false;",
+              "static bool bhop_enabled = false;",
               "",
               'extern "C" void VILDAN_Init(void)',
               "{",
@@ -98,6 +124,12 @@ jobs:
               "    IMGUI_CHECKVERSION();",
               "    ImGui::CreateContext();",
               "    ImGui::StyleColorsDark();",
+              "    ImGuiIO& io = ImGui::GetIO();",
+              "    io.IniFilename = nullptr;",
+              "    ImFontConfig font_cfg;",
+              "    font_cfg.SizePixels = 26.0f;",
+              "    io.Fonts->AddFontDefault(&font_cfg);",
+              "    ImGui::GetStyle().ScaleAllSizes(1.7f);",
               '    if (!ImGui_ImplOpenGL3_Init("#version 100")) {',
               "        ImGui::DestroyContext();",
               "        return;",
@@ -105,20 +137,24 @@ jobs:
               "    vildan_imgui_ready = true;",
               "}",
               "",
-              'extern "C" void VILDAN_DrawMenu(void)',
+              'extern "C" void VILDAN_DrawMenu(int width, int height)',
               "{",
-              "    if (!vildan_imgui_ready) return;",
-              "    GLint viewport[4];",
-              "    glGetIntegerv(GL_VIEWPORT, viewport);",
+              "    if (!vildan_imgui_ready || width <= 0 || height <= 0) return;",
               "    ImGuiIO& io = ImGui::GetIO();",
-              "    io.DisplaySize = ImVec2((float)viewport[2], (float)viewport[3]);",
+              "    io.DisplaySize = ImVec2((float)width, (float)height);",
               "    io.DeltaTime = 1.0f / 60.0f;",
               "    ImGui_ImplOpenGL3_NewFrame();",
               "    ImGui::NewFrame();",
-              '    ImGui::SetNextWindowPos(ImVec2(50, 50), ImGuiCond_FirstUseEver);',
-              '    ImGui::Begin("VILDAN 3D");',
-              '    ImGui::Text("Mod Menu Base is Working!");',
-              '    ImGui::Text("Screen: %d x %d", viewport[2], viewport[3]);',
+              '    ImGui::SetNextWindowSize(ImVec2(800, 560), ImGuiCond_FirstUseEver);',
+              '    ImGui::SetNextWindowPos(ImVec2(40, 40), ImGuiCond_FirstUseEver);',
+              '    ImGui::Begin("VILDAN 3D - Mod Menu");',
+              '    ImGui::Text("Welcome to VILDAN 3D!");',
+              '    ImGui::Separator();',
+              '    ImGui::Checkbox("ESP (Wallhack)", &esp_enabled);',
+              '    ImGui::Checkbox("Aimbot", &aimbot_enabled);',
+              '    ImGui::Checkbox("Bhop", &bhop_enabled);',
+              '    ImGui::Separator();',
+              '    ImGui::Text("Screen: %d x %d", width, height);',
               "    ImGui::End();",
               "    ImGui::Render();",
               "    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());",
@@ -126,11 +162,12 @@ jobs:
           ])
           Path("engine/ref/gl/vildan_menu.cpp").write_text(menu_cpp)
 
-          wscript_path = Path("engine/ref/gl/wscript")
-          w = wscript_path.read_text()
+          # 4. Патчим wscript
+          w_path = Path("engine/ref/gl/wscript")
+          w = w_path.read_text()
           source_marker = "\tsource = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])"
-          if w.count(source_marker) != 1: raise RuntimeError("Unexpected source declaration")
-
+          if w.count(source_marker) != 1: raise RuntimeError("Source marker not found")
+          
           imgui_setup = (
               "\timgui_dir = bld.srcnode.find_dir('3rdparty/imgui')\n"
               "\timgui_backend_dir = imgui_dir.find_dir('backends')\n"
@@ -141,20 +178,7 @@ jobs:
           )
           w = w.replace(source_marker, source_marker + "\n" + imgui_setup, 1)
 
-          loop_marker = "\tfor k,v in targets.items():"
-          if w.count(loop_marker) != 1: raise RuntimeError("Unexpected targets loop")
-          w = w.replace(loop_marker, "\ttargets['ref_gles1']['enable'] = False\n\n" + loop_marker, 1)
-
-          old_shlib = (
-              "\t\tbld.shlib(source = source,\n"
-              "\t\t\ttarget = k,\n"
-              "\t\t\tincludes = includes,\n"
-              "\t\t\tfeatures = 'format',\n"
-              "\t\t\tuse = libs + v['libs'],\n"
-              "\t\t\tdefines = v['defines'] + ['REF_DLL=1'],\n"
-              "\t\t\tinstall_path = bld.env.LIBDIR)"
-          )
-
+          old_shlib = "\t\tbld.shlib(source = source,\n\t\t\ttarget = k,\n\t\t\tincludes = includes,\n\t\t\tfeatures = 'format',\n\t\t\tuse = libs + v['libs'],\n\t\t\tdefines = v['defines'] + ['REF_DLL=1'],\n\t\t\tinstall_path = bld.env.LIBDIR)"
           new_shlib = (
               "\t\tif k in ('ref_gl4es',):\n"
               "\t\t\tbase_includes = includes if isinstance(includes, list) else [includes]\n"
@@ -165,25 +189,28 @@ jobs:
               "\t\telse:\n"
               "\t\t\tbld.shlib(source = source, target = k, includes = includes, features = 'format', use = libs + v['libs'], defines = v['defines'] + ['REF_DLL=1'], install_path = bld.env.LIBDIR)"
           )
+          if w.count(old_shlib) != 1: raise RuntimeError("Shlib marker not found")
           w = w.replace(old_shlib, new_shlib, 1)
-          compile(w, str(wscript_path), "exec")
-          wscript_path.write_text(w)
+          compile(w, str(w_path), "exec")
+          w_path.write_text(w)
 
-          opengl_path = Path("engine/ref/gl/gl_opengl.c")
-          o = opengl_path.read_text()
+          # 5. Патчим gl_opengl.c
+          o_path = Path("engine/ref/gl/gl_opengl.c")
+          o = o_path.read_text()
           if '#include "vildan_menu.h"' not in o: o = '#include "vildan_menu.h"\n' + o
           context_marker = "\tGL_OnContextCreated();"
-          if o.count(context_marker) == 1:
-              o = o.replace(context_marker, context_marker + "\n#ifdef VILDAN_IMGUI\n\tVILDAN_Init();\n#endif", 1)
-          opengl_path.write_text(o)
+          if o.count(context_marker) != 1: raise RuntimeError("Context marker not found")
+          o = o.replace(context_marker, context_marker + "\n#ifdef VILDAN_IMGUI\n\tVILDAN_Init();\n#endif", 1)
+          o_path.write_text(o)
 
-          main_path = Path("engine/ref/gl/gl_rmain.c")
-          m = main_path.read_text()
+          # 6. Патчим gl_rmain.c
+          m_path = Path("engine/ref/gl/gl_rmain.c")
+          m = m_path.read_text()
           if '#include "vildan_menu.h"' not in m: m = '#include "vildan_menu.h"\n' + m
           swap_marker = "\tgEngfuncs.GL_SwapBuffers();"
-          if m.count(swap_marker) == 1:
-              m = m.replace(swap_marker, "#ifdef VILDAN_IMGUI\n\tVILDAN_DrawMenu();\n#endif\n" + swap_marker, 1)
-          main_path.write_text(m)
+          if m.count(swap_marker) != 1: raise RuntimeError("SwapBuffers marker not found")
+          m = m.replace(swap_marker, "#ifdef VILDAN_IMGUI\n\tint screen_w = 0, screen_h = 0;\n\tgEngfuncs.CL_GetScreenInfo(&screen_w, &screen_h);\n\tVILDAN_DrawMenu(screen_w, screen_h);\n#endif\n" + swap_marker, 1)
+          m_path.write_text(m)
 
       - name: Init submodules
         shell: bash
@@ -218,16 +245,8 @@ jobs:
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/build_android.sh
-          echo "=== Built ref libraries ==="
-          find . -name "libref_*.so" -print
-          if ! find . -name "libref_gl4es.so" | grep -q .; then
-            echo "ERROR: libref_gl4es.so was not built. ImGui menu cannot work."
-            exit 1
-          fi
-          if find . -name "libref_gles1.so" | grep -q .; then
-            echo "ERROR: libref_gles1.so is still being built and would be preferred by the engine."
-            exit 1
-          fi
+          if ! find . -name "libref_gl4es.so" | grep -q .; then echo "ERROR: libref_gl4es.so missing"; exit 1; fi
+          if find . -name "libref_gles1.so" | grep -q .; then echo "ERROR: libref_gles1.so still built"; exit 1; fi
 
       - name: Collect APKs
         run: |
@@ -236,5 +255,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: VILDAN3D-Debug-APK
+          name: VILDAN3D-Menu-Big
           path: out/apk/*.apk
