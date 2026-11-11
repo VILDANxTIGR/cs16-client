@@ -88,12 +88,7 @@ jobs:
               '#include "vildan_menu.h"',
               '#include "imgui.h"',
               '#include "imgui_impl_opengl3.h"',
-              'extern "C" {',
-              '    #include "qgl.h"',
-              '    #include "console.h"',
-              '    extern int ScreenWidth;',
-              '    extern int ScreenHeight;',
-              '}',
+              '#include <GLES2/gl2.h>',
               "",
               "static bool vildan_imgui_ready = false;",
               "",
@@ -103,28 +98,27 @@ jobs:
               "    IMGUI_CHECKVERSION();",
               "    ImGui::CreateContext();",
               "    ImGui::StyleColorsDark();",
-              '    Con_Printf("VILDAN 3D: Initializing ImGui...\\n");',
               '    if (!ImGui_ImplOpenGL3_Init("#version 100")) {',
-              '        Con_Printf("VILDAN 3D: ERROR - ImGui_ImplOpenGL3_Init failed!\\n");',
               "        ImGui::DestroyContext();",
               "        return;",
               "    }",
-              '    Con_Printf("VILDAN 3D: ImGui Initialized Successfully!\\n");',
               "    vildan_imgui_ready = true;",
               "}",
               "",
               'extern "C" void VILDAN_DrawMenu(void)',
               "{",
               "    if (!vildan_imgui_ready) return;",
+              "    GLint viewport[4];",
+              "    glGetIntegerv(GL_VIEWPORT, viewport);",
               "    ImGuiIO& io = ImGui::GetIO();",
-              "    io.DisplaySize = ImVec2((float)ScreenWidth, (float)ScreenHeight);",
+              "    io.DisplaySize = ImVec2((float)viewport[2], (float)viewport[3]);",
               "    io.DeltaTime = 1.0f / 60.0f;",
               "    ImGui_ImplOpenGL3_NewFrame();",
               "    ImGui::NewFrame();",
               '    ImGui::SetNextWindowPos(ImVec2(50, 50), ImGuiCond_FirstUseEver);',
               '    ImGui::Begin("VILDAN 3D");',
               '    ImGui::Text("Mod Menu Base is Working!");',
-              '    ImGui::Text("Screen: %d x %d", ScreenWidth, ScreenHeight);',
+              '    ImGui::Text("Screen: %d x %d", viewport[2], viewport[3]);',
               "    ImGui::End();",
               "    ImGui::Render();",
               "    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());",
@@ -136,7 +130,7 @@ jobs:
           w = wscript_path.read_text()
           source_marker = "\tsource = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])"
           if w.count(source_marker) != 1: raise RuntimeError("Unexpected source declaration")
-          
+
           imgui_setup = (
               "\timgui_dir = bld.srcnode.find_dir('3rdparty/imgui')\n"
               "\timgui_backend_dir = imgui_dir.find_dir('backends')\n"
@@ -146,6 +140,10 @@ jobs:
               "\timgui_includes = [imgui_dir.abspath(), imgui_backend_dir.abspath()]"
           )
           w = w.replace(source_marker, source_marker + "\n" + imgui_setup, 1)
+
+          loop_marker = "\tfor k,v in targets.items():"
+          if w.count(loop_marker) != 1: raise RuntimeError("Unexpected targets loop")
+          w = w.replace(loop_marker, "\ttargets['ref_gles1']['enable'] = False\n\n" + loop_marker, 1)
 
           old_shlib = (
               "\t\tbld.shlib(source = source,\n"
@@ -158,7 +156,7 @@ jobs:
           )
 
           new_shlib = (
-              "\t\tif k in ('ref_gles1', 'ref_gl4es', 'ref_gles3compat'):\n"
+              "\t\tif k in ('ref_gl4es',):\n"
               "\t\t\tbase_includes = includes if isinstance(includes, list) else [includes]\n"
               "\t\t\ttarget_includes = base_includes + imgui_includes\n"
               "\t\t\ttarget_source = source + imgui_sources\n"
@@ -220,6 +218,16 @@ jobs:
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/build_android.sh
+          echo "=== Built ref libraries ==="
+          find . -name "libref_*.so" -print
+          if ! find . -name "libref_gl4es.so" | grep -q .; then
+            echo "ERROR: libref_gl4es.so was not built. ImGui menu cannot work."
+            exit 1
+          fi
+          if find . -name "libref_gles1.so" | grep -q .; then
+            echo "ERROR: libref_gles1.so is still being built and would be preferred by the engine."
+            exit 1
+          fi
 
       - name: Collect APKs
         run: |
