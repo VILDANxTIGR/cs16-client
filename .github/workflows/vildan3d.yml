@@ -245,7 +245,7 @@ jobs:
               "\t\t\tinstall_path = bld.env.LIBDIR)"
           )
 
-          # ImGui добавляем только в GLES2-совместимые Android renderer.
+          # ImGui добавляем только в GLES2-совместимые Android renderer + GLESv2
           new_shlib = (
               "\t\tif k in ('ref_gl4es', 'ref_gles3compat'):\n"
               "\t\t\tbase_includes = includes if isinstance(includes, list) else [includes]\n"
@@ -262,6 +262,7 @@ jobs:
               "\t\t\t\ttarget = k,\n"
               "\t\t\t\tincludes = target_includes,\n"
               "\t\t\t\tuse = libs + v['libs'],\n"
+              "\t\t\t\tlib = ['GLESv2'],\n"
               "\t\t\t\tdefines = target_defines,\n"
               "\t\t\t\tinstall_path = bld.env.LIBDIR\n"
               "\t\t\t)\n"
