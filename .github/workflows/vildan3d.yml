@@ -133,15 +133,21 @@ jobs:
               '        ImGui::SetNextWindowPos(ImVec2(40, 40), ImGuiCond_FirstUseEver);',
               '        if (ImGui::Begin("VILDAN 3D - Mod Menu", &is_menu_open)) {',
               '            ImGui::Text("Welcome to VILDAN 3D!"); ImGui::Separator();',
-              "            float esp = ((float(*)(const char*, float))gEngfuncs)(\"vildan_esp\", 0.0f);",
+              "            float esp = 0.0f;",
+              "            cvar_t* cvar_esp = gEngfuncs->pfnGetCvarPointer(\"vildan_esp\");",
+              "            if (cvar_esp) esp = cvar_esp->value;",
               "            bool esp_b = esp > 0.5f;",
-              '            if (ImGui::Checkbox("ESP (Wallhack)", &esp_b)) { ((void(*)(const char*, float))((void**)gEngfuncs)[24])(\"vildan_esp\", esp_b ? 1.0f : 0.0f); }',
-              "            float aim = ((float(*)(const char*, float))gEngfuncs)(\"vildan_aimbot\", 0.0f);",
+              '            if (ImGui::Checkbox("ESP (Wallhack)", &esp_b)) { if (cvar_esp) cvar_esp->value = esp_b ? 1.0f : 0.0f; }',
+              "            float aim = 0.0f;",
+              "            cvar_t* cvar_aim = gEngfuncs->pfnGetCvarPointer(\"vildan_aimbot\");",
+              "            if (cvar_aim) aim = cvar_aim->value;",
               "            bool aim_b = aim > 0.5f;",
-              '            if (ImGui::Checkbox("Aimbot", &aim_b)) { ((void(*)(const char*, float))((void**)gEngfuncs)[24])(\"vildan_aimbot\", aim_b ? 1.0f : 0.0f); }',
-              "            float bhop = ((float(*)(const char*, float))gEngfuncs)(\"vildan_bhop\", 0.0f);",
+              '            if (ImGui::Checkbox("Aimbot", &aim_b)) { if (cvar_aim) cvar_aim->value = aim_b ? 1.0f : 0.0f; }',
+              "            float bhop = 0.0f;",
+              "            cvar_t* cvar_bhop = gEngfuncs->pfnGetCvarPointer(\"vildan_bhop\");",
+              "            if (cvar_bhop) bhop = cvar_bhop->value;",
               "            bool bhop_b = bhop > 0.5f;",
-              '            if (ImGui::Checkbox("Bhop", &bhop_b)) { ((void(*)(const char*, float))((void**)gEngfuncs)[24])(\"vildan_bhop\", bhop_b ? 1.0f : 0.0f); }',
+              '            if (ImGui::Checkbox("Bhop", &bhop_b)) { if (cvar_bhop) cvar_bhop->value = bhop_b ? 1.0f : 0.0f; }',
               '            ImGui::Separator(); ImGui::Text("Screen: %d x %d", viewport[2], viewport[3]);',
               '            if (ImGui::Button("Свернуть")) { is_menu_open = false; }',
               "        } ImGui::End();",
@@ -179,7 +185,7 @@ jobs:
           m_path = Path("engine/ref/gl/gl_rmain.c"); m = m_path.read_text()
           if '#include "vildan_menu.h"' not in m: m = '#include "vildan_menu.h"\n' + m
           esp_old = "R_DrawStudioModel( RI.currententity );"
-          esp_new = 'if ( RI.currententity->player && ((float(*)(const char*, float))gEngfuncs)("vildan_esp", 0.0f) > 0.5f ) {\n\tGLboolean od = pglIsEnabled(GL_DEPTH_TEST);\n\tpglDisable(GL_DEPTH_TEST);\n\tR_DrawStudioModel(RI.currententity);\n\tif(od) pglEnable(GL_DEPTH_TEST);\n} else {\n\tR_DrawStudioModel(RI.currententity);\n}'
+          esp_new = 'if ( RI.currententity->player && gEngfuncs->pfnGetCvarPointer("vildan_esp") && gEngfuncs->pfnGetCvarPointer("vildan_esp")->value > 0.5f ) {\n\tGLboolean od = pglIsEnabled(GL_DEPTH_TEST);\n\tpglDisable(GL_DEPTH_TEST);\n\tR_DrawStudioModel(RI.currententity);\n\tif(od) pglEnable(GL_DEPTH_TEST);\n} else {\n\tR_DrawStudioModel(RI.currententity);\n}'
           if m.count(esp_old) == 2: m = m.replace(esp_old, esp_new)
           sm2 = "\tgEngfuncs.GL_SwapBuffers();"
           if m.count(sm2) == 1: m = m.replace(sm2, "#ifdef VILDAN_IMGUI\n\tVILDAN_DrawMenu();\n#endif\n" + sm2, 1)
@@ -266,5 +272,4 @@ jobs:
           find engine client -name "*.apk" -exec cp {} out/apk/ \;
       - uses: actions/upload-artifact@v4
         with:
-          name: VILDAN3D-Working-Cheats
-          path: out/apk/*.apk
+          name: VILDAN3D-
