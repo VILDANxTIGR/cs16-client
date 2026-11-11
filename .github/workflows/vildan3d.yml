@@ -8,6 +8,10 @@ env:
   ENGINE_REPO: VILDANxTIGR/xash3d-fwgs
   CLIENT_REPO: VILDANxTIGR/cs16-client
   NDK_VERSION: 28.2.13676358
+  SDL_VERSION: 2.32.10
+  FFMPEG_VERSION: '9.0'
+  GH_CPU_OS: android
+  GH_CPU_ARCH: multiarch
 
 jobs:
   build:
@@ -24,7 +28,7 @@ jobs:
 
       - name: Install deps
         run: |
-          sudo apt-get update && sudo apt-get install -y cmake ninja-build
+          sudo apt-get update && sudo apt-get install -y cmake ninja-build unzip
           SM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SM" --licenses > /dev/null || true
           "$SM" --install "platform-tools" "platforms;android-35" "build-tools;36.0.0" "ndk;${NDK_VERSION}"
@@ -36,7 +40,7 @@ jobs:
           git clone --depth 1 https://github.com/ocornut/imgui.git engine/3rdparty/imgui
 
       - name: Patch Engine for ImGui
-        shell: python
+        shell: python {0}
         run: |
           import os
 
@@ -71,7 +75,7 @@ jobs:
           with open("engine/ref/gl/vildan_menu.cpp", "w") as f:
               f.write(menu_cpp)
 
-          # 3. Патчим wscript (добавляем файлы и C++ линковку)
+          # 3. Патчим wscript (ФИКС ОШИБКИ С features)
           wscript_path = "engine/ref/gl/wscript"
           with open(wscript_path, "r") as f:
               w = f.read()
@@ -84,31 +88,33 @@ jobs:
                   "source += [imgui_dir.find_node('imgui.cpp'), imgui_dir.find_node('imgui_draw.cpp'), imgui_dir.find_node('imgui_tables.cpp'), imgui_dir.find_node('imgui_widgets.cpp'), imgui_dir.find_node('backends/imgui_impl_opengl3.cpp'), bld.path.find_node('vildan_menu.cpp')]\n"
                   "includes = ['.', imgui_dir.abspath(), imgui_dir.find_dir('backends').abspath()]"
               )
-              # Добавляем поддержку C++ компиляции
-              w = w.replace("bld.shlib(", "bld.shlib(features=['c', 'cxx', 'cxxshlib'], ")
+              
+              # Заменяем существующий features, а не добавляем новый
+              if w.count("features = 'format'") != 1:
+                  raise RuntimeError("Unexpected Waf features declaration")
+              w = w.replace("features = 'format'", "features = ['c', 'cxx', 'cxxshlib', 'format']", 1)
+              
               with open(wscript_path, "w") as f:
                   f.write(w)
-              print("Wscript patched")
           else:
-              print("ERROR: Could not find source in wscript")
+              raise RuntimeError("Could not find source in wscript")
 
-          # 4. Патчим gl_opengl.c (Инициализация)
+          # 4. Патчим gl_opengl.c (Вставляем перед комментарием, после R_Init_Video)
           opengl_path = "engine/ref/gl/gl_opengl.c"
           with open(opengl_path, "r") as f:
               o = f.read()
           if '#include "vildan_menu.h"' not in o:
               o = '#include "vildan_menu.h"\n' + o
           
-          marker = 'if( !gEngfuncs.R_Init_Video( REF_GL ))\n\t{\n\t\tCon_Printf( S_ERROR "R_Init: failed to initialize video\\n" );\n\t\treturn false;\n\t}'
+          marker = '// see R_ProcessEntData for tr.entities initialization'
           if marker in o:
-              o = o.replace(marker, marker + '\n\tVILDAN_Init();')
-              print("gl_opengl.c patched")
+              o = o.replace(marker, 'VILDAN_Init();\n\n\t' + marker, 1)
           else:
-              print("ERROR: R_Init_Video marker not found in gl_opengl.c")
+              raise RuntimeError("R_Init_Video marker not found in gl_opengl.c")
           with open(opengl_path, "w") as f:
               f.write(o)
 
-          # 5. Патчим gl_rmain.c (Отрисовка)
+          # 5. Патчим gl_rmain.c (Вставляем отрисовку)
           main_path = "engine/ref/gl/gl_rmain.c"
           with open(main_path, "r") as f:
               m = f.read()
@@ -117,9 +123,8 @@ jobs:
 
           if 'gEngfuncs.GL_SwapBuffers();' in m:
               m = m.replace('gEngfuncs.GL_SwapBuffers();', 'VILDAN_DrawMenu();\n\tgEngfuncs.GL_SwapBuffers();')
-              print("gl_rmain.c patched")
           else:
-              print("ERROR: GL_SwapBuffers not found in gl_rmain.c")
+              raise RuntimeError("GL_SwapBuffers not found in gl_rmain.c")
           with open(main_path, "w") as f:
               f.write(m)
 
@@ -134,12 +139,58 @@ jobs:
             popd
           done
 
+      - name: Prepare reliable downloads
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.ci-bin"
+          printf '%s\n' \
+          '#!/usr/bin/env bash' \
+          'set -euo pipefail' \
+          'REAL_WGET=/usr/bin/wget' \
+          'STREAM=false' \
+          'for arg in "$@"; do' \
+          '  [ "$arg" = "-qO-" ] && STREAM=true' \
+          'done' \
+          'if [ "$STREAM" = false ]; then' \
+          '  exec "$REAL_WGET" --timeout=30 --tries=5 --waitretry=5 --retry-connrefused "$@"' \
+          'fi' \
+          'URL="$1"' \
+          'TMP="$(mktemp)"' \
+          'trap "rm -f \$TMP" EXIT' \
+          'for attempt in 1 2 3 4 5; do' \
+          '  if "$REAL_WGET" -q --timeout=30 --tries=3 --waitretry=5 --retry-connrefused -O "$TMP" "$URL"; then' \
+          '    valid=0' \
+          '    case "$URL" in' \
+          '      *.tar.gz) gzip -t "$TMP" || valid=1 ;;' \
+          '      *.tar.xz) xz -t "$TMP" || valid=1 ;;' \
+          '      *.zip) unzip -tq "$TMP" || valid=1 ;;' \
+          '      *) test -s "$TMP" || valid=1 ;;' \
+          '    esac' \
+          '    if [ "$valid" -eq 0 ]; then' \
+          '      cat "$TMP"' \
+          '      exit 0' \
+          '    fi' \
+          '  fi' \
+          '  echo "Download attempt $attempt/5 failed: $URL" >&2' \
+          '  sleep "$attempt"' \
+          'done' \
+          'echo "Download failed after 5 attempts: $URL" >&2' \
+          'exit 1' > "$GITHUB_WORKSPACE/.ci-bin/wget"
+          chmod +x "$GITHUB_WORKSPACE/.ci-bin/wget"
+          echo "$GITHUB_WORKSPACE/.ci-bin" >> "$GITHUB_PATH"
+
       - name: Build
         shell: bash
         run: |
           set -euo pipefail
+          export GH_CPU_OS=android
+          export FFMPEG_VERSION=9.0
+          
           cd engine
+          # Синхронизируем версию NDK в скрипте сборки
+          sed -i 's/ANDROID_NDK_VERSION="29.0.14206865"/ANDROID_NDK_VERSION="28.2.13676358"/' scripts/gha/deps_android.sh || true
           sed -i 's/setOf("armeabi-v7a", "arm64-v8a", "x86")/setOf("arm64-v8a")/' android/app/build.gradle.kts
+          
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/deps_android.sh
           
           export ANDROID_HOME="$PWD/sdk"
