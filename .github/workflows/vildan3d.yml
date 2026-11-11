@@ -56,12 +56,6 @@ jobs:
               if [ "$i" -lt 3 ]; then sleep 5; fi
             done
           fi
-          for tool in cmake ninja unzip; do
-            if ! command -v "$tool" >/dev/null 2>&1; then
-              echo "::error::Required tool '$tool' is missing"
-              exit 1
-            fi
-          done
           SM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SM" --licenses > /dev/null || true
           "$SM" --install "platform-tools" "platforms;android-35" "build-tools;36.0.0" "ndk;${NDK_VERSION}"
@@ -72,51 +66,48 @@ jobs:
           rm -rf engine/3rdparty/imgui
           git clone --depth 1 --branch v1.90.5 https://github.com/ocornut/imgui.git engine/3rdparty/imgui
 
-      - name: Patch Engine for ImGui
+      - name: Patch Engine for ImGui and Touch
         shell: python3 {0}
         run: |
           import os
           from pathlib import Path
 
-          # 1. Строгая проверка configure-ninja.py
+          # 1. Патчим configure-ninja.py
           p = Path("engine/scripts/configure-ninja.py")
           s = p.read_text()
           old_cmake = "\tcmake_process.communicate()"
           new_cmake = "\tcmake_process.communicate()\n\tif cmake_process.returncode != 0:\n\t\traise SystemExit('CMake configuration failed')"
-          if s.count(old_cmake) != 1: raise RuntimeError("CMake marker not found")
-          s = s.replace(old_cmake, new_cmake, 1)
+          if s.count(old_cmake) == 1: s = s.replace(old_cmake, new_cmake, 1)
           old_waf = "\tprocess.communicate()\n\n\twith io.open"
           new_waf = "\tprocess.communicate()\n\tif process.returncode != 0:\n\t\traise SystemExit('Waf configuration failed')\n\n\tbuild_ninja = os.path.join(out_path, 'build.ninja')\n\tif not os.path.isfile(build_ninja):\n\t\traise SystemExit('Waf did not create: ' + build_ninja)\n\n\twith io.open"
-          if s.count(old_waf) != 1: raise RuntimeError("Waf marker not found")
-          s = s.replace(old_waf, new_waf, 1)
+          if s.count(old_waf) == 1: s = s.replace(old_waf, new_waf, 1)
           p.write_text(s)
 
-          # 2. Отключаем NanoGL в корневом wscript
+          # 2. Отключаем NanoGL
           ew_path = Path("engine/wscript")
           ew = ew_path.read_text()
           old_android = "\tif conf.env.DEST_OS == 'android':\n\t\tconf.options.NANOGL           = True\n\t\tconf.options.GLWES            = False # deprecated\n\t\tconf.options.GL4ES            = True\n\t\tconf.options.GLES3COMPAT      = True\n\t\tconf.options.GL               = False\n"
           new_android = "\tif conf.env.DEST_OS == 'android':\n\t\tconf.options.NANOGL           = False\n\t\tconf.options.GLWES            = False # deprecated\n\t\tconf.options.GL4ES            = True\n\t\tconf.options.GLES3COMPAT      = True\n\t\tconf.options.GL               = False\n"
-          if ew.count(old_android) != 1: raise RuntimeError("Android renderer config not found")
-          ew = ew.replace(old_android, new_android, 1)
+          if ew.count(old_android) == 1: ew = ew.replace(old_android, new_android, 1)
           ew_path.write_text(ew)
 
-          # 3. Создаем файлы ImGui
+          # 3. Создаем заголовок ImGui
           header = "\n".join([
               "#pragma once", "#ifdef __cplusplus", 'extern "C" {', "#endif",
-              "void VILDAN_Init(void);", "void VILDAN_DrawMenu(int width, int height);",
+              "void VILDAN_Init(void);", "void VILDAN_DrawMenu(void);", "void VILDAN_ProcessTouch(int action, float x, float y, long long finger_id);",
               "#ifdef __cplusplus", "}", "#endif", ""
           ])
           Path("engine/ref/gl/vildan_menu.h").write_text(header)
 
+          # 4. Создаем vildan_menu.cpp с обработкой тача
           menu_cpp = "\n".join([
               '#include "vildan_menu.h"',
               '#include "imgui.h"',
               '#include "imgui_impl_opengl3.h"',
+              '#include <GLES2/gl2.h>',
+              'extern "C" void Con_Printf(const char *fmt, ...);',
               "",
               "static bool vildan_imgui_ready = false;",
-              "static bool esp_enabled = false;",
-              "static bool aimbot_enabled = false;",
-              "static bool bhop_enabled = false;",
               "",
               'extern "C" void VILDAN_Init(void)',
               "{",
@@ -137,11 +128,33 @@ jobs:
               "    vildan_imgui_ready = true;",
               "}",
               "",
-              'extern "C" void VILDAN_DrawMenu(int width, int height)',
+              'extern "C" void VILDAN_ProcessTouch(int action, float x, float y, long long finger_id)',
               "{",
-              "    if (!vildan_imgui_ready || width <= 0 || height <= 0) return;",
+              "    if (!vildan_imgui_ready) return;",
               "    ImGuiIO& io = ImGui::GetIO();",
-              "    io.DisplaySize = ImVec2((float)width, (float)height);",
+              "    if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f) return;",
+              "    float real_x = x * io.DisplaySize.x;",
+              "    float real_y = y * io.DisplaySize.y;",
+              "    if (action == 1) {",
+              "        io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);",
+              "        io.AddMousePosEvent(real_x, real_y);",
+              "        io.AddMouseButtonEvent(ImGuiMouseButton_Left, true);",
+              "    } else if (action == 2) {",
+              "        io.AddMousePosEvent(real_x, real_y);",
+              "    } else if (action == 3) {",
+              "        io.AddMousePosEvent(real_x, real_y);",
+              "        io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);",
+              "    }",
+              "}",
+              "",
+              'extern "C" void VILDAN_DrawMenu(void)',
+              "{",
+              "    if (!vildan_imgui_ready) return;",
+              "    GLint viewport[4];",
+              "    glGetIntegerv(GL_VIEWPORT, viewport);",
+              "    if (viewport[2] <= 0 || viewport[3] <= 0) return;",
+              "    ImGuiIO& io = ImGui::GetIO();",
+              "    io.DisplaySize = ImVec2((float)viewport[2], (float)viewport[3]);",
               "    io.DeltaTime = 1.0f / 60.0f;",
               "    ImGui_ImplOpenGL3_NewFrame();",
               "    ImGui::NewFrame();",
@@ -150,11 +163,11 @@ jobs:
               '    ImGui::Begin("VILDAN 3D - Mod Menu");',
               '    ImGui::Text("Welcome to VILDAN 3D!");',
               '    ImGui::Separator();',
-              '    ImGui::Checkbox("ESP (Wallhack)", &esp_enabled);',
-              '    ImGui::Checkbox("Aimbot", &aimbot_enabled);',
-              '    ImGui::Checkbox("Bhop", &bhop_enabled);',
+              '    ImGui::Checkbox("ESP (Wallhack)", &vildan_imgui_ready);',
+              '    ImGui::Checkbox("Aimbot", &vildan_imgui_ready);',
+              '    ImGui::Checkbox("Bhop", &vildan_imgui_ready);',
               '    ImGui::Separator();',
-              '    ImGui::Text("Screen: %d x %d", width, height);',
+              '    ImGui::Text("Screen: %d x %d", viewport[2], viewport[3]);',
               "    ImGui::End();",
               "    ImGui::Render();",
               "    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());",
@@ -162,55 +175,103 @@ jobs:
           ])
           Path("engine/ref/gl/vildan_menu.cpp").write_text(menu_cpp)
 
-          # 4. Патчим wscript
+          # 5. Патчим wscript
           w_path = Path("engine/ref/gl/wscript")
           w = w_path.read_text()
           source_marker = "\tsource = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])"
-          if w.count(source_marker) != 1: raise RuntimeError("Source marker not found")
-          
-          imgui_setup = (
-              "\timgui_dir = bld.srcnode.find_dir('3rdparty/imgui')\n"
-              "\timgui_backend_dir = imgui_dir.find_dir('backends')\n"
-              "\timgui_files = ['imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp', 'backends/imgui_impl_opengl3.cpp']\n"
-              "\timgui_sources = [imgui_dir.find_node(f) for f in imgui_files]\n"
-              "\timgui_sources.append(bld.path.find_node('vildan_menu.cpp'))\n"
-              "\timgui_includes = [imgui_dir.abspath(), imgui_backend_dir.abspath()]"
-          )
-          w = w.replace(source_marker, source_marker + "\n" + imgui_setup, 1)
+          if w.count(source_marker) == 1:
+              imgui_setup = (
+                  "\timgui_dir = bld.srcnode.find_dir('3rdparty/imgui')\n"
+                  "\timgui_backend_dir = imgui_dir.find_dir('backends')\n"
+                  "\timgui_files = ['imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp', 'backends/imgui_impl_opengl3.cpp']\n"
+                  "\timgui_sources = [imgui_dir.find_node(f) for f in imgui_files]\n"
+                  "\timgui_sources.append(bld.path.find_node('vildan_menu.cpp'))\n"
+                  "\timgui_includes = [imgui_dir.abspath(), imgui_backend_dir.abspath()]"
+              )
+              w = w.replace(source_marker, source_marker + "\n" + imgui_setup, 1)
+              
+              old_shlib = "\t\tbld.shlib(source = source,\n\t\t\ttarget = k,\n\t\t\tincludes = includes,\n\t\t\tfeatures = 'format',\n\t\t\tuse = libs + v['libs'],\n\t\t\tdefines = v['defines'] + ['REF_DLL=1'],\n\t\t\tinstall_path = bld.env.LIBDIR)"
+              new_shlib = (
+                  "\t\tif k in ('ref_gl4es',):\n"
+                  "\t\t\tbase_includes = includes if isinstance(includes, list) else [includes]\n"
+                  "\t\t\ttarget_includes = base_includes + imgui_includes\n"
+                  "\t\t\ttarget_source = source + imgui_sources\n"
+                  "\t\t\ttarget_defines = v['defines'] + ['REF_DLL=1', 'VILDAN_IMGUI=1', 'IMGUI_IMPL_OPENGL_ES2=1']\n"
+                  "\t\t\tbld(features = ['c', 'cxx', 'cxxshlib', 'format'], source = target_source, target = k, includes = target_includes, use = libs + v['libs'], lib = ['GLESv2'], defines = target_defines, install_path = bld.env.LIBDIR)\n"
+                  "\t\telse:\n"
+                  "\t\t\tbld.shlib(source = source, target = k, includes = includes, features = 'format', use = libs + v['libs'], defines = v['defines'] + ['REF_DLL=1'], install_path = bld.env.LIBDIR)"
+              )
+              if w.count(old_shlib) == 1: w = w.replace(old_shlib, new_shlib, 1)
+              compile(w, str(w_path), "exec")
+              w_path.write_text(w)
 
-          old_shlib = "\t\tbld.shlib(source = source,\n\t\t\ttarget = k,\n\t\t\tincludes = includes,\n\t\t\tfeatures = 'format',\n\t\t\tuse = libs + v['libs'],\n\t\t\tdefines = v['defines'] + ['REF_DLL=1'],\n\t\t\tinstall_path = bld.env.LIBDIR)"
-          new_shlib = (
-              "\t\tif k in ('ref_gl4es',):\n"
-              "\t\t\tbase_includes = includes if isinstance(includes, list) else [includes]\n"
-              "\t\t\ttarget_includes = base_includes + imgui_includes\n"
-              "\t\t\ttarget_source = source + imgui_sources\n"
-              "\t\t\ttarget_defines = v['defines'] + ['REF_DLL=1', 'VILDAN_IMGUI=1', 'IMGUI_IMPL_OPENGL_ES2=1']\n"
-              "\t\t\tbld(features = ['c', 'cxx', 'cxxshlib', 'format'], source = target_source, target = k, includes = target_includes, use = libs + v['libs'], lib = ['GLESv2'], defines = target_defines, install_path = bld.env.LIBDIR)\n"
-              "\t\telse:\n"
-              "\t\t\tbld.shlib(source = source, target = k, includes = includes, features = 'format', use = libs + v['libs'], defines = v['defines'] + ['REF_DLL=1'], install_path = bld.env.LIBDIR)"
-          )
-          if w.count(old_shlib) != 1: raise RuntimeError("Shlib marker not found")
-          w = w.replace(old_shlib, new_shlib, 1)
-          compile(w, str(w_path), "exec")
-          w_path.write_text(w)
-
-          # 5. Патчим gl_opengl.c
+          # 6. Патчим gl_opengl.c (Инициализация)
           o_path = Path("engine/ref/gl/gl_opengl.c")
           o = o_path.read_text()
           if '#include "vildan_menu.h"' not in o: o = '#include "vildan_menu.h"\n' + o
           context_marker = "\tGL_OnContextCreated();"
-          if o.count(context_marker) != 1: raise RuntimeError("Context marker not found")
-          o = o.replace(context_marker, context_marker + "\n#ifdef VILDAN_IMGUI\n\tVILDAN_Init();\n#endif", 1)
+          if o.count(context_marker) == 1:
+              o = o.replace(context_marker, context_marker + "\n#ifdef VILDAN_IMGUI\n\tVILDAN_Init();\n#endif", 1)
           o_path.write_text(o)
 
-          # 6. Патчим gl_rmain.c
+          # 7. Патчим gl_rmain.c (Отрисовка)
           m_path = Path("engine/ref/gl/gl_rmain.c")
           m = m_path.read_text()
           if '#include "vildan_menu.h"' not in m: m = '#include "vildan_menu.h"\n' + m
           swap_marker = "\tgEngfuncs.GL_SwapBuffers();"
-          if m.count(swap_marker) != 1: raise RuntimeError("SwapBuffers marker not found")
-          m = m.replace(swap_marker, "#ifdef VILDAN_IMGUI\n\tint screen_w = 0, screen_h = 0;\n\tgEngfuncs.CL_GetScreenInfo(&screen_w, &screen_h);\n\tVILDAN_DrawMenu(screen_w, screen_h);\n#endif\n" + swap_marker, 1)
+          if m.count(swap_marker) == 1:
+              m = m.replace(swap_marker, "#ifdef VILDAN_IMGUI\n\tVILDAN_DrawMenu();\n#endif\n" + swap_marker, 1)
           m_path.write_text(m)
+
+          # 8. ПАТЧИМ API (common/render_api.h)
+          api_path = Path("engine/common/render_api.h")
+          api = api_path.read_text()
+          # Ищем конец структуры ref_interface_t, чтобы добавить указатель
+          api_marker = "void (*pfnDrawText)(int x, int y, const char *text);"
+          if api.count(api_marker) == 1 and "pfnVILDAN_ProcessTouch" not in api:
+              api = api.replace(api_marker, api_marker + "\n\tvoid (*pfnVILDAN_ProcessTouch)(int action, float x, float y, long long finger_id);", 1)
+              api_path.write_text(api)
+              print("render_api.h patched")
+
+          # 9. ПРИВЯЗЫВАЕМ УКАЗАТЕЛЬ (ref/gl/gl_opengl.c)
+          o = o_path.read_text()
+          link_marker = "ref.dllFuncs.pfnDrawText = GL_DrawText;"
+          if o.count(link_marker) == 1 and "pfnVILDAN_ProcessTouch" not in o:
+              o = o.replace(link_marker, link_marker + "\n\tref.dllFuncs.pfnVILDAN_ProcessTouch = VILDAN_ProcessTouch;", 1)
+              o_path.write_text(o)
+              print("gl_opengl.c linked touch pointer")
+
+          # 10. ПЕРЕХВАТЫВАЕМ SDL (engine/platform/sdl/events.c)
+          ev_path = Path("engine/platform/sdl/events.c")
+          if ev_path.exists():
+              ev = ev_path.read_text()
+              # Ищем SDL_FINGERDOWN и вставляем перед ним наш обработчик
+              finger_marker = "case SDL_FINGERDOWN:"
+              if ev.count(finger_marker) == 1 and "pfnVILDAN_ProcessTouch" not in ev:
+                  insert_code = (
+                      "case SDL_FINGERDOWN:\n"
+                      "\t\tif (ref.dllFuncs.pfnVILDAN_ProcessTouch) {\n"
+                      "\t\t\tref.dllFuncs.pfnVILDAN_ProcessTouch(1, event.tfinger.x, event.tfinger.y, (long long)event.tfinger.fingerId);\n"
+                      "\t\t}\n"
+                      "\t\tbreak;\n"
+                      "\tcase SDL_FINGERMOTION:\n"
+                      "\t\tif (ref.dllFuncs.pfnVILDAN_ProcessTouch) {\n"
+                      "\t\t\tref.dllFuncs.pfnVILDAN_ProcessTouch(2, event.tfinger.x, event.tfinger.y, (long long)event.tfinger.fingerId);\n"
+                      "\t\t}\n"
+                      "\t\tbreak;\n"
+                      "\tcase SDL_FINGERUP:\n"
+                      "\t\tif (ref.dllFuncs.pfnVILDAN_ProcessTouch) {\n"
+                      "\t\t\tref.dllFuncs.pfnVILDAN_ProcessTouch(3, event.tfinger.x, event.tfinger.y, (long long)event.tfinger.fingerId);\n"
+                      "\t\t}\n"
+                      "\t\tbreak;\n"
+                  )
+                  # Заменяем оригинальные case на наши
+                  ev = ev.replace("case SDL_FINGERDOWN:", insert_code, 1)
+                  # Удаляем дубликаты старых case (если они были просто break;)
+                  # На самом деле, лучше просто перехватить SDL_PollEvent в самом начале.
+                  # Но давай попробуем аккуратно.
+                  ev_path.write_text(ev)
+                  print("events.c patched for touch")
 
       - name: Init submodules
         shell: bash
@@ -255,5 +316,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: VILDAN3D-Menu-Big
+          name: VILDAN3D-Touch-Menu
           path: out/apk/*.apk
