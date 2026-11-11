@@ -1,0 +1,160 @@
+name: VILDAN 3D Base
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+env:
+  ENGINE_REPO: VILDANxTIGR/xash3d-fwgs
+  CLIENT_REPO: VILDANxTIGR/cs16-client
+  NDK_VERSION: 28.2.13676358
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Engine
+        uses: actions/checkout@v4
+        with: { repository: '${{ env.ENGINE_REPO }}', path: engine }
+      - name: Checkout Client
+        uses: actions/checkout@v4
+        with: { repository: '${{ env.CLIENT_REPO }}', path: client }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21' }
+
+      - name: Install deps
+        run: |
+          sudo apt-get update && sudo apt-get install -y cmake ninja-build
+          SM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SM" --licenses > /dev/null || true
+          "$SM" --install "platform-tools" "platforms;android-35" "build-tools;36.0.0" "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Setup ImGui
+        run: |
+          mkdir -p engine/3rdparty
+          git clone --depth 1 https://github.com/ocornut/imgui.git engine/3rdparty/imgui
+
+      - name: Patch Engine for ImGui
+        shell: python
+        run: |
+          import os
+
+          # 1. Создаем заголовочный файл
+          header_cpp = "#pragma once\n#ifdef __cplusplus\nextern \"C\" {\n#endif\nvoid VILDAN_Init(void);\nvoid VILDAN_DrawMenu(void);\n#ifdef __cplusplus\n}\n#endif\n"
+          with open("engine/ref/gl/vildan_menu.h", "w") as f:
+              f.write(header_cpp)
+
+          # 2. Создаем файл реализации
+          menu_cpp = (
+              '#include "vildan_menu.h"\n'
+              '#include "imgui.h"\n'
+              '#include "imgui_impl_opengl3.h"\n'
+              'extern "C" void VILDAN_Init(void)\n'
+              '{\n'
+              '    IMGUI_CHECKVERSION();\n'
+              '    ImGui::CreateContext();\n'
+              '    ImGui::StyleColorsDark();\n'
+              '    ImGui_ImplOpenGL3_Init("#version 100");\n'
+              '}\n'
+              'extern "C" void VILDAN_DrawMenu(void)\n'
+              '{\n'
+              '    ImGui_ImplOpenGL3_NewFrame();\n'
+              '    ImGui::NewFrame();\n'
+              '    ImGui::Begin("VILDAN 3D");\n'
+              '    ImGui::Text("Mod Menu Base is Working!");\n'
+              '    ImGui::End();\n'
+              '    ImGui::Render();\n'
+              '    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());\n'
+              '}\n'
+          )
+          with open("engine/ref/gl/vildan_menu.cpp", "w") as f:
+              f.write(menu_cpp)
+
+          # 3. Патчим wscript (добавляем файлы и C++ линковку)
+          wscript_path = "engine/ref/gl/wscript"
+          with open(wscript_path, "r") as f:
+              w = f.read()
+          
+          if "source = bld.path.ant_glob" in w:
+              w = w.replace(
+                  "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])",
+                  "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])\n"
+                  "imgui_dir = bld.srcnode.find_dir('3rdparty/imgui')\n"
+                  "source += [imgui_dir.find_node('imgui.cpp'), imgui_dir.find_node('imgui_draw.cpp'), imgui_dir.find_node('imgui_tables.cpp'), imgui_dir.find_node('imgui_widgets.cpp'), imgui_dir.find_node('backends/imgui_impl_opengl3.cpp'), bld.path.find_node('vildan_menu.cpp')]\n"
+                  "includes = ['.', imgui_dir.abspath(), imgui_dir.find_dir('backends').abspath()]"
+              )
+              # Добавляем поддержку C++ компиляции
+              w = w.replace("bld.shlib(", "bld.shlib(features=['c', 'cxx', 'cxxshlib'], ")
+              with open(wscript_path, "w") as f:
+                  f.write(w)
+              print("Wscript patched")
+          else:
+              print("ERROR: Could not find source in wscript")
+
+          # 4. Патчим gl_opengl.c (Инициализация)
+          opengl_path = "engine/ref/gl/gl_opengl.c"
+          with open(opengl_path, "r") as f:
+              o = f.read()
+          if '#include "vildan_menu.h"' not in o:
+              o = '#include "vildan_menu.h"\n' + o
+          
+          marker = 'if( !gEngfuncs.R_Init_Video( REF_GL ))\n\t{\n\t\tCon_Printf( S_ERROR "R_Init: failed to initialize video\\n" );\n\t\treturn false;\n\t}'
+          if marker in o:
+              o = o.replace(marker, marker + '\n\tVILDAN_Init();')
+              print("gl_opengl.c patched")
+          else:
+              print("ERROR: R_Init_Video marker not found in gl_opengl.c")
+          with open(opengl_path, "w") as f:
+              f.write(o)
+
+          # 5. Патчим gl_rmain.c (Отрисовка)
+          main_path = "engine/ref/gl/gl_rmain.c"
+          with open(main_path, "r") as f:
+              m = f.read()
+          if '#include "vildan_menu.h"' not in m:
+              m = '#include "vildan_menu.h"\n' + m
+
+          if 'gEngfuncs.GL_SwapBuffers();' in m:
+              m = m.replace('gEngfuncs.GL_SwapBuffers();', 'VILDAN_DrawMenu();\n\tgEngfuncs.GL_SwapBuffers();')
+              print("gl_rmain.c patched")
+          else:
+              print("ERROR: GL_SwapBuffers not found in gl_rmain.c")
+          with open(main_path, "w") as f:
+              f.write(m)
+
+      - name: Init submodules
+        run: |
+          set -euo pipefail
+          for d in engine client; do
+            pushd "$d"
+            if git ls-files --stage | grep -q '^160000'; then
+              git submodule sync --recursive && git submodule update --init --recursive
+            fi
+            popd
+          done
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd engine
+          sed -i 's/setOf("armeabi-v7a", "arm64-v8a", "x86")/setOf("arm64-v8a")/' android/app/build.gradle.kts
+          GITHUB_WORKSPACE="$PWD" bash scripts/gha/deps_android.sh
+          
+          export ANDROID_HOME="$PWD/sdk"
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
+          
+          GITHUB_WORKSPACE="$PWD" bash scripts/gha/build_android.sh
+
+      - name: Collect APKs
+        run: |
+          mkdir -p out/apk
+          find engine -name "*.apk" -exec cp {} out/apk/ \;
+          ls -lh out/apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VILDAN3D-Base-APK
+          path: out/apk/*.apk
