@@ -265,7 +265,8 @@ jobs:
           cd client/android
           chmod +x gradlew
           ./gradlew clean assembleGitDebug -Pandroid.injected.build.abi=arm64-v8a
-      
-      # НОВЫЙ БЛОК СБОРА И ЗАГРУЗКИ АРТЕФАКТОВ
       - name: Collect and Upload APKs
-        if:e
+        if: always()
+        run: |
+          set -euo pipefail
+ e
