@@ -265,8 +265,28 @@ jobs:
           cd client/android
           chmod +x gradlew
           ./gradlew clean assembleGitDebug -Pandroid.injected.build.abi=arm64-v8a
-      - name: Collect, Rename and Upload APKs
-        if: always()
-        shell: bash
-        run: |
- e
+- name: Collect, Rename and Upload APKs
+  if: always()
+  shell: bash
+  run: |
+    set -euo pipefail
+    mkdir -p out/apk
+
+    find engine -name "*.apk" -exec cp {} out/apk/VILDAN3D_Engine.apk \;
+    find client -name "*.apk" -exec cp {} out/apk/VILDAN3D_Client.apk \;
+
+    cd out/apk
+    if [ -z "$(ls -A *.apk 2>/dev/null)" ]; then
+      echo "❌ APK файлы не найдены!"
+      exit 1
+    fi
+
+    echo "✅ Найдены файлы:"
+    ls -la
+- name: Upload VILDAN3D Artifact
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: VILDAN3D_Release
+    path: out/apk/*.apk
+    if-no-files-found: error
