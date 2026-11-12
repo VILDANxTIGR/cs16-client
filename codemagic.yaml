@@ -11,6 +11,7 @@ workflows:
       - name: Clone Engine and Setup Deps
         script: |
           set -e
+          rm -rf engine
           git clone https://github.com/VILDANxTIGR/xash3d-fwgs.git engine
           cd engine
           git checkout 707596f4905689ec224e993fcaa4d4ad66aa67d6
