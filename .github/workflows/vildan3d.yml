@@ -34,7 +34,7 @@ jobs:
           
           # 3. FFmpeg (через curl, версия n6.0)
           mkdir -p engine/3rdparty/ffmpeg
-          curl -sL "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n6.0.tar.gz" -o /tmp/ffmpeg.tar.gz
+          curl -sL "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/refs/tags/n6.0" -o /tmp/ffmpeg.tar.gz
           tar -xzf /tmp/ffmpeg.tar.gz --strip-components=1 -C engine/3rdparty/ffmpeg
       - name: Patch All
         shell: bash
@@ -47,16 +47,17 @@ jobs:
               txt = path.read_text()
               if o in txt: path.write_text(txt.replace(o, n, 1))
 
-          # 1. Патчим deps_android.sh
+          # 1. Патчим deps_android.sh (SDL)
           p("engine/scripts/gha/deps_android.sh", 
             'echo "Download SDL"\npushd 3rdparty || exit 1\nwget "https://github.com/libsdl-org/SDL/releases/download/release-$SDL_VERSION/SDL2-$SDL_VERSION.tar.gz" -qO- | tar -xzf - || exit 1\nmv "SDL2-$SDL_VERSION" SDL\npopd || exit 1', 
             'if [ ! -f 3rdparty/SDL/CMakeLists.txt ]; then\n    echo "Download SDL"\n    pushd 3rdparty || exit 1\n    wget "https://github.com/libsdl-org/SDL/releases/download/release-$SDL_VERSION/SDL2-$SDL_VERSION.tar.gz" -qO- | tar -xzf - || exit 1\n    mv "SDL2-$SDL_VERSION" SDL\n    popd || exit 1\nelse\n    echo "SDL2 already exists, skipping download"\nfi')
           
+          # 2. Патчим deps_android.sh (FFmpeg)
           p("engine/scripts/gha/deps_android.sh", 
             'echo "Download FFMpeg"\npushd 3rdparty || exit 1\nwget "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n$FFMPEG_VERSION.tar.gz" -qO- | tar -xzf - || exit 1\nmv "FFmpeg-n$FFMPEG_VERSION" ffmpeg\npopd || exit 1', 
             'if [ ! -d 3rdparty/ffmpeg ]; then\n    echo "Download FFMpeg"\n    pushd 3rdparty || exit 1\n    wget "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n$FFMPEG_VERSION.tar.gz" -qO- | tar -xzf - || exit 1\n    mv "FFmpeg-n$FFMPEG_VERSION" ffmpeg\n    popd || exit 1\nelse\n    echo "FFmpeg already exists, skipping download"\nfi')
 
-          # 2. Генерация ImGui меню
+          # 3. Генерация ImGui меню
           Path("engine/ref/gl/vildan_menu.h").write_text('#pragma once\n#ifdef __cplusplus\nextern "C" {\n#endif\nvoid VILDAN_Init(void);\nvoid VILDAN_DrawMenu(void);\nvoid VILDAN_ProcessTouch(int, float, float, long long);\n#ifdef __cplusplus\n}\n#endif')
           
           cpp = r'''#include "vildan_menu.h"
@@ -118,18 +119,18 @@ jobs:
           }'''
           Path("engine/ref/gl/vildan_menu.cpp").write_text(cpp)
           
-          # 3. Патчи движка
+          # 4. Патчи движка
           p("engine/ref/gl/gl_opengl.c", "#include \"../ref_api.h\"", "#include \"../ref_api.h\"\n#include \"vildan_menu.h\"")
           p("engine/ref/gl/gl_rmain.c", "#include \"../ref_api.h\"", "#include \"../ref_api.h\"\n#include \"vildan_menu.h\"")
           p("engine/ref/gl/gl_opengl.c", "GL_OnContextCreated();", "VILDAN_Init();")
           p("engine/ref/gl/gl_rmain.c", "R_DrawStudioModel( RI.currententity );", 'if(RI.currententity->player && gEngfuncs.pfnGetCvarPointer("vildan_esp") && gEngfuncs.pfnGetCvarPointer("vildan_esp")->value > 0.5f) { GLboolean od = pglIsEnabled(GL_DEPTH_TEST); pglDisable(GL_DEPTH_TEST); R_DrawStudioModel(RI.currententity); if(od) pglEnable(GL_DEPTH_TEST); } else R_DrawStudioModel(RI.currententity);')
           p("engine/ref/gl/gl_rmain.c", "gEngfuncs.GL_SwapBuffers();", "VILDAN_DrawMenu();\ngEngfuncs.GL_SwapBuffers();")
           
-          # 4. Патч wscript (добавляем SDL)
+          # 5. Патч wscript (добавляем SDL)
           p("engine/ref/gl/wscript", "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])", "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])\n\ti = bld.srcnode.find_dir('3rdparty/imgui')\n\ts = bld.srcnode.find_dir('3rdparty/SDL/include')\n\tsource += [bld.path.find_node('vildan_menu.cpp'), i.find_node('imgui.cpp'), i.find_node('imgui_draw.cpp'), i.find_node('imgui_tables.cpp'), i.find_node('imgui_widgets.cpp'), i.find_node('backends/imgui_impl_opengl3.cpp')]\n\tincludes = [i.abspath(), i.find_dir('backends').abspath(), s.abspath()]")
           p("engine/ref/gl/wscript", "bld.shlib(source = source,", "bld(features = 'cxxshlib', lib = ['GLESv2'], source = source,")
 
-          # 5. Патч клиента (Аим/Бхоп)
+          # 6. Патч клиента (Аим/Бхоп)
           n = '''void IN_Move( float frametime, usercmd_t *cmd )\n{\n    cl_entity_t *local = gEngfuncs.GetLocalPlayer();\n    if (local && gEngfuncs.pfnGetCvarPointer("vildan_bhop") && gEngfuncs.pfnGetCvarPointer("vildan_bhop")->value > 0.5f && (cmd->buttons & IN_JUMP)) {\n        if (local->curstate.onground != -1) cmd->buttons |= IN_JUMP;\n        else cmd->buttons &= ~IN_JUMP;\n    }\n    if (gEngfuncs.pfnGetCvarPointer("vildan_aimbot") && gEngfuncs.pfnGetCvarPointer("vildan_aimbot")->value > 0.5f && local && (cmd->buttons & IN_ATTACK)) {\n        cl_entity_t *bt = NULL; float bd = 99999.0f; vec3_t d;\n        for (int i = 1; i <= 32; i++) {\n            cl_entity_t *e = gEngfuncs.GetEntityByIndex(i);\n            if (e && e->player && e->curstate.health > 0 && e->index != local->index) {\n                d[0] = e->origin[0] - local->origin[0]; d[1] = e->origin[1] - local->origin[1]; d[2] = e->origin[2] - local->origin[2];\n                float dist = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);\n                if (dist < bd && dist < 2000.0f) { bd = dist; bt = e; }\n            }\n        }\n        if (bt) {\n            d[0] = bt->origin[0] - local->origin[0]; d[1] = bt->origin[1] - local->origin[1]; d[2] = bt->origin[2] - local->origin[2];\n            float hyp = sqrt(d[0]*d[0] + d[1]*d[1]);\n            cmd->viewangles[0] = atan2(d[2], hyp) * 180.0f / M_PI;\n            cmd->viewangles[1] = atan2(d[1], d[0]) * 180.0f / M_PI;\n        }\n    }'''
           p("client/cl_dll/input/input_xash3d.cpp", "void IN_Move( float frametime, usercmd_t *cmd )\n{", n)
           p("client/cl_dll/cdll_int.cpp", 'static void LoadMenuInterface( void )\n{\n\tif( g_pMenu )\n\t\treturn;\n\n\tg_pMenu = GetNativeMenuExports();\n\tif( !g_pMenu )\n\t\tHUD_MessageBox( "Error: native object \\"MenuFactory\\" is unavailable\\n" );\n}', 'static void LoadMenuInterface( void )\n{\n\tg_pMenu = nullptr;\n}')
