@@ -13,7 +13,15 @@ workflows:
           git clone https://github.com/VILDANxTIGR/xash3d-fwgs.git engine
           cd engine
           git checkout 707596f4905689ec224e993fcaa4d4ad66aa67d6
+          
+          # Инициализируем все базовые субмодули
           git submodule update --init --recursive
+          
+          # ВАЖНО: Принудительно инициализируем nanogl и gl4es, 
+          # так как Waf падает без них (ошибка "Can't find 3rdparty/nanogl submodule")
+          git submodule update --init --checkout 3rdparty/nanogl
+          git submodule update --init --checkout 3rdparty/gl4es/gl4es || true
+          
           cd ..
           
           # Gradle берёт NDK из build.gradle.kts
@@ -57,7 +65,7 @@ workflows:
           set -e
           mkdir -p ci
           
-          # 1. Создаем патч для configure-ninja.py (от Perplexity)
+          # 1. Создаем патч для configure-ninja.py
           cat << 'PATCH_EOF' > ci/patch_configure_ninja.py
           import sys, io, re
           p = sys.argv[1]
@@ -112,7 +120,7 @@ workflows:
           print("configure-ninja.py patched")
           PATCH_EOF
 
-          # 2. Применяем наш патч к wscript и создаем меню (без изменений)
+          # 2. Применяем патч к wscript и создаем меню
           python3 << 'PYEOF'
           import os, re
           from pathlib import Path
@@ -298,7 +306,7 @@ workflows:
           patch_file("cl_dll/cdll_int.cpp", 'static void LoadMenuInterface( void )\n{\n\tif( g_pMenu )\n\t\treturn;\n\n\tg_pMenu = GetNativeMenuExports();\n\tif( !g_pMenu )\n\t\tHUD_MessageBox( "Error: native object \\"MenuFactory\\" is unavailable\\n" );\n}', 'static void LoadMenuInterface( void )\n{\n\tg_pMenu = nullptr;\n}')
           PYEOF
           
-          # Применяем патч от Перплексити
+          # Применяем патч для configure-ninja.py
           cd engine
           chmod +x waf android/gradlew android/app/run-python
           printf '#!/bin/bash\nexec python3 "$@"\n' > android/app/run-python
@@ -316,7 +324,7 @@ workflows:
 
           cd engine
           
-          # Ручной запуск waf configure для диагностики (если упадет - покажет лог)
+          # Ручной запуск waf configure для диагностики
           WAFLOCK=.lock-waf_android_arm64-v8a_manual python3 ./waf configure \
             -t . -o build-android-arm64 -T debug \
             --android=arm64-v8a,,21 \
@@ -324,7 +332,7 @@ workflows:
             --enable-ffmpeg --enable-ffmpeg-dlopen --ffmpeg-dir=3rdparty/ffmpeg \
             ninja || { echo '===== config.log ====='; tail -n 300 build-android-arm64/config.log; exit 1; }
           
-          # Запуск сборки через Gradle
+          # Запуск сборки через Gradle (движок)
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
           (cd android && ./gradlew assembleDebug --no-daemon --stacktrace -Pandroid.injected.build.abi=arm64-v8a)
           cd ..
