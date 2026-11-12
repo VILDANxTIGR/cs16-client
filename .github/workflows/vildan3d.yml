@@ -3,8 +3,10 @@ on: [workflow_dispatch, push]
 env:
   ENGINE_REPO: VILDANxTIGR/xash3d-fwgs
   CLIENT_REPO: VILDANxTIGR/cs16-client
-  NDK_VERSION: 28.2.13676358
-  FFMPEG_VERSION: '6.0'
+  NDK_VERSION: '28.2.13676358'
+  FFMPEG_TAG: 'n6.0'
+  IMGUI_TAG: 'v1.90.5'
+  SDL_TAG: 'release-2.30.0'
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -15,55 +17,59 @@ jobs:
         with: { repository: '${{ env.CLIENT_REPO }}', path: client }
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '21' }
-      
-      - name: Deps
+
+      - name: Deps / NDK
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq cmake ninja-build unzip curl
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install "ndk;${NDK_VERSION}" > /dev/null
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> $GITHUB_ENV
-          
-      - name: Setup Dependencies (ImGui, SDL, FFmpeg)
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq cmake ninja-build unzip curl xz-utils python3
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${NDK_VERSION}" >/dev/null
+          NDK="$SDK/ndk/${NDK_VERSION}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+
+      - name: Setup Dependencies
         run: |
+          set -euo pipefail
           cd engine
-          rm -rf 3rdparty/imgui 3rdparty/SDL 3rdparty/ffmpeg
-          
-          # 1. ImGui
-          git clone --depth 1 --branch v1.90.5 https://github.com/ocornut/imgui.git 3rdparty/imgui
-          
-          # 2. SDL (с флагом -f для отлова 404)
-          mkdir -p 3rdparty/SDL
-          curl -fsSL "https://codeload.github.com/libsdl-org/SDL/tar.gz/refs/tags/release-2.30.0" -o /tmp/SDL2.tar.gz
-          tar -xzf /tmp/SDL2.tar.gz --strip-components=1 -C 3rdparty/SDL
-          
-          # 3. FFmpeg n6.0 (с флагом -f для отлова 404)
+          mkdir -p 3rdparty
+          rm -rf 3rdparty/imgui 3rdparty/SDL 3rdparty/SDL2 3rdparty/ffmpeg
+
+          # ImGui
+          git clone --depth 1 --branch "${IMGUI_TAG}" https://github.com/ocornut/imgui.git 3rdparty/imgui
+
+          # SDL2 (Клод сказал, что Xash3d ждет SDL2, но скрипт проверяет SDL - делаем симлинк)
+          curl -fsSL --retry 3 --retry-delay 2 -o /tmp/sdl2.tar.gz "https://github.com/libsdl-org/SDL/archive/refs/tags/${SDL_TAG}.tar.gz"
+          mkdir -p 3rdparty/SDL2
+          tar -xzf /tmp/sdl2.tar.gz --strip-components=1 -C 3rdparty/SDL2
+          ln -s SDL2 3rdparty/SDL
+
+          # FFmpeg (скачиваем исходники)
+          curl -fsSL --retry 3 --retry-delay 2 -o /tmp/ffmpeg.tar.gz "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/refs/tags/${FFMPEG_TAG}"
           mkdir -p 3rdparty/ffmpeg
-          curl -fsSL "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n6.0.tar.gz" -o /tmp/ffmpeg.tar.gz
           tar -xzf /tmp/ffmpeg.tar.gz --strip-components=1 -C 3rdparty/ffmpeg
-          
-          echo "Проверка скачанных файлов:"
-          ls -la 3rdparty/SDL/include/SDL.h
-          ls -la 3rdparty/ffmpeg/configure
 
       - name: Patch All
         shell: bash
         run: |
-          cd engine
-          
-          # ЖЕСТКИЙ ПАТЧ СКРИПТА (отключаем скачивание FFmpeg)
-          # Ищем любую строку с wget и ffmpeg (в любом регистре) и комментируем её
-          sed -E -i -e '/^[[:space:]]*#/b' -e 's/^([[:space:]]*)(.*[Ww][Gg][Ee][Tt].*([Ff][Ff][Mm][Pp][Ee][Gg]|n9\.0).*)/\1# \2/' scripts/gha/deps_android.sh
-          
-          cd ..
           python3 << 'PYEOF'
+          import os, re
           from pathlib import Path
-          def p(f, o, n):
-              path = Path(f)
-              if not path.exists(): return
-              txt = path.read_text()
-              if o in txt: path.write_text(txt.replace(o, n, 1))
 
-          # Генерация ImGui меню (ЧИТЫ НА МЕСТЕ)
+          # 1. Отключаем скачивание в deps_android.sh (замена на no-op ":")
+          deps = Path("engine/scripts/gha/deps_android.sh")
+          if deps.exists():
+              out = []
+              for line in deps.read_text().splitlines():
+                  if re.search(r'(wget|curl)', line) and re.search(r'(SDL|ffmpeg|FFmpeg)', line, re.IGNORECASE):
+                      out.append(": # [PATCHED] Skipped download: " + line.strip())
+                  else:
+                      out.append(line)
+              deps.write_text("\n".join(out))
+              print("deps_android.sh patched.")
+
+          # 2. Генерация ImGui меню
           Path("engine/ref/gl/vildan_menu.h").write_text('#pragma once\n#ifdef __cplusplus\nextern "C" {\n#endif\nvoid VILDAN_Init(void);\nvoid VILDAN_DrawMenu(void);\nvoid VILDAN_ProcessTouch(int, float, float, long long);\n#ifdef __cplusplus\n}\n#endif')
           
           cpp = r'''#include "vildan_menu.h"
@@ -124,49 +130,95 @@ jobs:
               ImGui::Render(); ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
           }'''
           Path("engine/ref/gl/vildan_menu.cpp").write_text(cpp)
-          
-          # Патчи движка
-          p("engine/ref/gl/gl_opengl.c", "#include \"../ref_api.h\"", "#include \"../ref_api.h\"\n#include \"vildan_menu.h\"")
-          p("engine/ref/gl/gl_rmain.c", "#include \"../ref_api.h\"", "#include \"../ref_api.h\"\n#include \"vildan_menu.h\"")
-          p("engine/ref/gl/gl_opengl.c", "GL_OnContextCreated();", "VILDAN_Init();")
-          p("engine/ref/gl/gl_rmain.c", "R_DrawStudioModel( RI.currententity );", 'if(RI.currententity->player && gEngfuncs.pfnGetCvarPointer("vildan_esp") && gEngfuncs.pfnGetCvarPointer("vildan_esp")->value > 0.5f) { GLboolean od = pglIsEnabled(GL_DEPTH_TEST); pglDisable(GL_DEPTH_TEST); R_DrawStudioModel(RI.currententity); if(od) pglEnable(GL_DEPTH_TEST); } else R_DrawStudioModel(RI.currententity);')
-          p("engine/ref/gl/gl_rmain.c", "gEngfuncs.GL_SwapBuffers();", "VILDAN_DrawMenu();\ngEngfuncs.GL_SwapBuffers();")
-          
-          # Патч wscript (добавляем SDL и ImGui)
-          p("engine/ref/gl/wscript", "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])", "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])\n\ti = bld.srcnode.find_dir('3rdparty/imgui')\n\ts = bld.srcnode.find_dir('3rdparty/SDL/include')\n\tsource += [bld.path.find_node('vildan_menu.cpp'), i.find_node('imgui.cpp'), i.find_node('imgui_draw.cpp'), i.find_node('imgui_tables.cpp'), i.find_node('imgui_widgets.cpp'), i.find_node('backends/imgui_impl_opengl3.cpp')]\n\tincludes = [i.abspath(), i.find_dir('backends').abspath(), s.abspath()]")
-          p("engine/ref/gl/wscript", "bld.shlib(source = source,", "bld(features = 'cxxshlib', lib = ['GLESv2'], source = source,")
 
-          # Патч клиента (Аим/Бхоп)
-          n = '''void IN_Move( float frametime, usercmd_t *cmd )\n{\n    cl_entity_t *local = gEngfuncs.GetLocalPlayer();\n    if (local && gEngfuncs.pfnGetCvarPointer("vildan_bhop") && gEngfuncs.pfnGetCvarPointer("vildan_bhop")->value > 0.5f && (cmd->buttons & IN_JUMP)) {\n        if (local->curstate.onground != -1) cmd->buttons |= IN_JUMP;\n        else cmd->buttons &= ~IN_JUMP;\n    }\n    if (gEngfuncs.pfnGetCvarPointer("vildan_aimbot") && gEngfuncs.pfnGetCvarPointer("vildan_aimbot")->value > 0.5f && local && (cmd->buttons & IN_ATTACK)) {\n        cl_entity_t *bt = NULL; float bd = 99999.0f; vec3_t d;\n        for (int i = 1; i <= 32; i++) {\n            cl_entity_t *e = gEngfuncs.GetEntityByIndex(i);\n            if (e && e->player && e->curstate.health > 0 && e->index != local->index) {\n                d[0] = e->origin[0] - local->origin[0]; d[1] = e->origin[1] - local->origin[1]; d[2] = e->origin[2] - local->origin[2];\n                float dist = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);\n                if (dist < bd && dist < 2000.0f) { bd = dist; bt = e; }\n            }\n        }\n        if (bt) {\n            d[0] = bt->origin[0] - local->origin[0]; d[1] = bt->origin[1] - local->origin[1]; d[2] = bt->origin[2] - local->origin[2];\n            float hyp = sqrt(d[0]*d[0] + d[1]*d[1]);\n            cmd->viewangles[0] = atan2(d[2], hyp) * 180.0f / M_PI;\n            cmd->viewangles[1] = atan2(d[1], d[0]) * 180.0f / M_PI;\n        }\n    }'''
-          p("client/cl_dll/input/input_xash3d.cpp", "void IN_Move( float frametime, usercmd_t *cmd )\n{", n)
-          p("client/cl_dll/cdll_int.cpp", 'static void LoadMenuInterface( void )\n{\n\tif( g_pMenu )\n\t\treturn;\n\n\tg_pMenu = GetNativeMenuExports();\n\tif( !g_pMenu )\n\t\tHUD_MessageBox( "Error: native object \\"MenuFactory\\" is unavailable\\n" );\n}', 'static void LoadMenuInterface( void )\n{\n\tg_pMenu = nullptr;\n}')
+          def patch_file(path, old, new):
+              p = Path(path)
+              if p.exists():
+                  txt = p.read_text()
+                  if old in txt:
+                      p.write_text(txt.replace(old, new, 1))
+
+          # 3. Патчи движка (Исправлено по совету Клода: добавляем, а не заменяем)
+          patch_file("engine/ref/gl/gl_opengl.c", "#include \"../ref_api.h\"", "#include \"../ref_api.h\"\n#include \"vildan_menu.h\"")
+          patch_file("engine/ref/gl/gl_rmain.c", "#include \"../ref_api.h\"", "#include \"../ref_api.h\"\n#include \"vildan_menu.h\"")
+          
+          # ТОЧКА ВЫЗОВА (Не заменяем, а добавляем после!)
+          patch_file("engine/ref/gl/gl_opengl.c", "GL_OnContextCreated();", "GL_OnContextCreated();\n\tVILDAN_Init();")
+          patch_file("engine/ref/gl/gl_rmain.c", "R_DrawStudioModel( RI.currententity );", 'if(RI.currententity->player && gEngfuncs.pfnGetCvarPointer("vildan_esp") && gEngfuncs.pfnGetCvarPointer("vildan_esp")->value > 0.5f) { GLboolean od = pglIsEnabled(GL_DEPTH_TEST); pglDisable(GL_DEPTH_TEST); R_DrawStudioModel(RI.currententity); if(od) pglEnable(GL_DEPTH_TEST); } else R_DrawStudioModel(RI.currententity);')
+          patch_file("engine/ref/gl/gl_rmain.c", "gEngfuncs.GL_SwapBuffers();", "VILDAN_DrawMenu();\n\tgEngfuncs.GL_SwapBuffers();")
+
+          # 4. Патч wscript (Исправлено: расширяем INCLUDES, а не перезаписываем includes)
+          patch_file("engine/ref/gl/wscript", "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])", "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])\n\ti = bld.srcnode.find_dir('3rdparty/imgui')\n\ts = bld.srcnode.find_dir('3rdparty/SDL/include')\n\tsource += [bld.path.find_node('vildan_menu.cpp'), i.find_node('imgui.cpp'), i.find_node('imgui_draw.cpp'), i.find_node('imgui_tables.cpp'), i.find_node('imgui_widgets.cpp'), i.find_node('backends/imgui_impl_opengl3.cpp')]\n\tbld.env.INCLUDES += [i.abspath(), i.find_dir('backends').abspath(), s.abspath()]")
+          patch_file("engine/ref/gl/wscript", "bld.shlib(source = source,", "bld(features = 'cxxshlib', lib = ['GLESv2'], source = source,")
+
+          # 5. Патч клиента (Исправлено по совету Клода: хелпер сверху + вызов внутри IN_Move)
+          in_path = Path("client/cl_dll/input/input_xash3d.cpp")
+          if in_path.exists():
+              in_txt = in_path.read_text()
+              helper = r'''#include <math.h>
+          static void vildan_move_fix( usercmd_t *cmd ) {
+              cl_entity_t *local = gEngfuncs.GetLocalPlayer();
+              if (!local) return;
+              cvar_t *bhop = gEngfuncs.pfnGetCvarPointer("vildan_bhop");
+              cvar_t *aim = gEngfuncs.pfnGetCvarPointer("vildan_aimbot");
+              if (bhop && bhop->value > 0.5f && (cmd->buttons & IN_JUMP)) {
+                  if (local->curstate.onground != -1) cmd->buttons |= IN_JUMP;
+                  else cmd->buttons &= ~IN_JUMP;
+              }
+              if (aim && aim->value > 0.5f && (cmd->buttons & IN_ATTACK)) {
+                  cl_entity_t *bt = NULL; float bd = 2000.0f; vec3_t d;
+                  for (int i = 1; i <= 32; i++) {
+                      cl_entity_t *e = gEngfuncs.GetEntityByIndex(i);
+                      if (!e || !e->player || e->curstate.health <= 0 || e->index == local->index) continue;
+                      float dist = sqrt((e->origin[0]-local->origin[0])*(e->origin[0]-local->origin[0]) + (e->origin[1]-local->origin[1])*(e->origin[1]-local->origin[1]) + (e->origin[2]-local->origin[2])*(e->origin[2]-local->origin[2]));
+                      if (dist < bd) { bd = dist; bt = e; }
+                  }
+                  if (bt) {
+                      d[0] = bt->origin[0] - local->origin[0]; d[1] = bt->origin[1] - local->origin[1]; d[2] = bt->origin[2] - local->origin[2];
+                      cmd->viewangles[0] = atan2f(d[2], sqrtf(d[0]*d[0] + d[1]*d[1])) * 180.0f / M_PI;
+                      cmd->viewangles[1] = atan2f(d[1], d[0]) * 180.0f / M_PI;
+                  }
+              }
+          }
+          '''
+              marker = "void IN_Move( float frametime, usercmd_t *cmd )\n{"
+              if marker in in_txt:
+                  # Вставляем хелпер перед функцией и вызов внутри
+                  in_txt = in_txt.replace(marker, helper + "\n" + marker + "\n    vildan_move_fix(cmd);", 1)
+                  in_path.write_text(in_txt)
+                  print("IN_Move patched correctly.")
+
+          # 6. Отключаем MenuFactory
+          patch_file("client/cl_dll/cdll_int.cpp", 'static void LoadMenuInterface( void )\n{\n\tif( g_pMenu )\n\t\treturn;\n\n\tg_pMenu = GetNativeMenuExports();\n\tif( !g_pMenu )\n\t\tHUD_MessageBox( "Error: native object \\"MenuFactory\\" is unavailable\\n" );\n}', 'static void LoadMenuInterface( void )\n{\n\tg_pMenu = nullptr;\n}')
           PYEOF
 
       - name: Build
         run: |
+          set -euo pipefail
           cd engine
+          # Убираем sed для ANDROID_HOME, Клод сказал это ломает пути
           sed -i 's/ANDROID_NDK_VERSION=.*/ANDROID_NDK_VERSION="28.2.13676358"/' scripts/gha/deps_android.sh
           sed -i 's/ndkVersion = .*/ndkVersion = "28.2.13676358"/' android/app/build.gradle.kts
           sed -i 's/setOf("armeabi-v7a", "arm64-v8a", "x86")/setOf("arm64-v8a")/' android/app/build.gradle.kts
           
-          # Запускаем скрипт зависимостей. Теперь он должен пропустить FFmpeg, так как папка существует и wget закомментирован.
+          # Запускаем скрипт. Пути ANDROID_HOME уже в $GITHUB_ENV, ничего не переопределяем.
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/deps_android.sh
           
-          export ANDROID_HOME="$PWD/sdk"; export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/build_android.sh
           
           cd ../client/android
           chmod +x gradlew
-          ./gradlew clean assembleGitDebug -Pandroid.injected.build.abi=arm64-v8a
-          
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+          ./gradlew --no-daemon clean assembleGitDebug -Pandroid.injected.build.abi=arm64-v8a
+
       - name: Save
         if: always()
         run: |
           mkdir -p out/apk
-          find engine -name "*.apk" | head -n 1 | xargs -I {} cp {} out/apk/VILDAN3D_Engine.apk || true
-          find client -name "*.apk" | head -n 1 | xargs -I {} cp {} out/apk/VILDAN3D_Client.apk || true
-          
+          find engine/android/app/build/outputs/apk -name "*.apk" | head -n 1 | xargs -I {} cp {} out/apk/VILDAN3D_Engine.apk || true
+          find client/android/app/build/outputs/apk -name "*.apk" | head -n 1 | xargs -I {} cp {} out/apk/VILDAN3D_Client.apk || true
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
