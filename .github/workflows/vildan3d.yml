@@ -16,55 +16,37 @@ jobs:
         with: { distribution: temurin, java-version: '21' }
       - name: Deps
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq cmake ninja-build unzip
+          sudo apt-get update -qq && sudo apt-get install -y -qq cmake ninja-build unzip curl
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install "ndk;${NDK_VERSION}" > /dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> $GITHUB_ENV
-      - name: Anti-Drop Downloader
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/.ci-bin"
-          cat << 'EOF' > "$GITHUB_WORKSPACE/.ci-bin/wget"
-          #!/usr/bin/env bash
-          REAL_WGET=/usr/bin/wget
-          URL=""
-          OUT=""
-          for arg in "$@"; do
-            if [[ "$arg" == http* ]]; then URL="$arg"; fi
-          done
-          for i in 1 2 3 4 5; do
-            if "$REAL_WGET" --timeout=30 --tries=3 --retry-connrefused "$@"; then
-              for f in "$@"; do
-                if [ -f "$f" ] && [[ "$f" == *.tar.* ]]; then
-                  if tar -tf "$f" >/dev/null 2>&1; then exit 0; fi
-                fi
-              done
-              if [ -z "$URL" ]; then exit 0; fi
-            fi
-            echo "Retry download $i for $URL"
-            sleep 3
-          done
-          exit 1
-          EOF
-          chmod +x "$GITHUB_WORKSPACE/.ci-bin/wget"
-          echo "$GITHUB_WORKSPACE/.ci-bin" >> "$GITHUB_PATH"
-      - name: ImGui
+      - name: Setup ImGui & SDL
         run: |
           rm -rf engine/3rdparty/imgui
           git clone --depth 1 --branch v1.90.5 https://github.com/ocornut/imgui.git engine/3rdparty/imgui
-      - name: Patch
+          
+          # Качаем SDL2 вручную по совету Джипити
+          mkdir -p engine/3rdparty/SDL
+          curl -fL "https://codeload.github.com/libsdl-org/SDL/tar.gz/refs/tags/release-2.30.0" -o /tmp/SDL2.tar.gz
+          tar -xzf /tmp/SDL2.tar.gz --strip-components=1 -C engine/3rdparty/SDL
+          test -f engine/3rdparty/SDL/CMakeLists.txt
+      - name: Patch All
         shell: bash
         run: |
           python3 << 'PYEOF'
           from pathlib import Path
-          def p(f, o, n, mode='replace'):
+          def p(f, o, n):
               path = Path(f)
               if not path.exists(): return
               txt = path.read_text()
-              if mode == 'prepend':
-                  if o not in txt: path.write_text(o + txt)
-              else:
-                  if o in txt: path.write_text(txt.replace(o, n, 1))
-          
+              if o in txt: path.write_text(txt.replace(o, n, 1))
+
+          # 1. Патч скрипта deps_android.sh (чтобы не качал битую SDL)
+          p("engine/scripts/gha/deps_android.sh", 
+            'echo "Download SDL"\npushd 3rdparty || exit 1\nwget "https://github.com/libsdl-org/SDL/releases/download/release-$SDL_VERSION/SDL2-$SDL_VERSION.tar.gz" -qO- | tar -xzf - || exit 1\nmv "SDL2-$SDL_VERSION" SDL\npopd || exit 1', 
+            'if [ ! -f 3rdparty/SDL/CMakeLists.txt ]; then\n    echo "Download SDL"\n    pushd 3rdparty || exit 1\n    wget "https://github.com/libsdl-org/SDL/releases/download/release-$SDL_VERSION/SDL2-$SDL_VERSION.tar.gz" -qO- | tar -xzf - || exit 1\n    mv "SDL2-$SDL_VERSION" SDL\n    popd || exit 1\nelse\n    echo "SDL2 already exists, skipping download"\nfi')
+
+          # 2. Генерация ImGui меню
           Path("engine/ref/gl/vildan_menu.h").write_text('#pragma once\n#ifdef __cplusplus\nextern "C" {\n#endif\nvoid VILDAN_Init(void);\nvoid VILDAN_DrawMenu(void);\nvoid VILDAN_ProcessTouch(int, float, float, long long);\n#ifdef __cplusplus\n}\n#endif')
           
           cpp = r'''#include "vildan_menu.h"
@@ -91,8 +73,7 @@ jobs:
           }
           extern "C" void VILDAN_Init(void) {
               if(r) return; IMGUI_CHECKVERSION(); ImGui::CreateContext(); ImGui::StyleColorsDark();
-              ImGui::GetIO().IniFilename = nullptr;
-              ImGui::GetIO().Fonts->AddFontDefault();
+              ImGui::GetIO().IniFilename = nullptr; ImGui::GetIO().Fonts->AddFontDefault();
               ImGui::GetStyle().ScaleAllSizes(1.7f);
               if(!ImGui_ImplOpenGL3_Init("#version 100")) return;
               SDL_AddEventWatch(VILDAN_EventWatch, NULL); r = true;
@@ -127,16 +108,18 @@ jobs:
           }'''
           Path("engine/ref/gl/vildan_menu.cpp").write_text(cpp)
           
-          p("engine/ref/gl/gl_opengl.c", '#include "vildan_menu.h"\n', '', 'prepend')
-          p("engine/ref/gl/gl_rmain.c", '#include "vildan_menu.h"\n', '', 'prepend')
-          
+          # 3. Патчи движка
+          p("engine/ref/gl/gl_opengl.c", "#include \"../ref_api.h\"", "#include \"../ref_api.h\"\n#include \"vildan_menu.h\"")
+          p("engine/ref/gl/gl_rmain.c", "#include \"../ref_api.h\"", "#include \"../ref_api.h\"\n#include \"vildan_menu.h\"")
           p("engine/ref/gl/gl_opengl.c", "GL_OnContextCreated();", "VILDAN_Init();")
           p("engine/ref/gl/gl_rmain.c", "R_DrawStudioModel( RI.currententity );", 'if(RI.currententity->player && gEngfuncs.pfnGetCvarPointer("vildan_esp") && gEngfuncs.pfnGetCvarPointer("vildan_esp")->value > 0.5f) { GLboolean od = pglIsEnabled(GL_DEPTH_TEST); pglDisable(GL_DEPTH_TEST); R_DrawStudioModel(RI.currententity); if(od) pglEnable(GL_DEPTH_TEST); } else R_DrawStudioModel(RI.currententity);')
           p("engine/ref/gl/gl_rmain.c", "gEngfuncs.GL_SwapBuffers();", "VILDAN_DrawMenu();\ngEngfuncs.GL_SwapBuffers();")
           
+          # 4. Патч wscript (добавляем SDL)
           p("engine/ref/gl/wscript", "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])", "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])\n\ti = bld.srcnode.find_dir('3rdparty/imgui')\n\ts = bld.srcnode.find_dir('3rdparty/SDL/include')\n\tsource += [bld.path.find_node('vildan_menu.cpp'), i.find_node('imgui.cpp'), i.find_node('imgui_draw.cpp'), i.find_node('imgui_tables.cpp'), i.find_node('imgui_widgets.cpp'), i.find_node('backends/imgui_impl_opengl3.cpp')]\n\tincludes = [i.abspath(), i.find_dir('backends').abspath(), s.abspath()]")
           p("engine/ref/gl/wscript", "bld.shlib(source = source,", "bld(features = 'cxxshlib', lib = ['GLESv2'], source = source,")
-          
+
+          # 5. Патч клиента (Аим/Бхоп)
           n = '''void IN_Move( float frametime, usercmd_t *cmd )\n{\n    cl_entity_t *local = gEngfuncs.GetLocalPlayer();\n    if (local && gEngfuncs.pfnGetCvarPointer("vildan_bhop") && gEngfuncs.pfnGetCvarPointer("vildan_bhop")->value > 0.5f && (cmd->buttons & IN_JUMP)) {\n        if (local->curstate.onground != -1) cmd->buttons |= IN_JUMP;\n        else cmd->buttons &= ~IN_JUMP;\n    }\n    if (gEngfuncs.pfnGetCvarPointer("vildan_aimbot") && gEngfuncs.pfnGetCvarPointer("vildan_aimbot")->value > 0.5f && local && (cmd->buttons & IN_ATTACK)) {\n        cl_entity_t *bt = NULL; float bd = 99999.0f; vec3_t d;\n        for (int i = 1; i <= 32; i++) {\n            cl_entity_t *e = gEngfuncs.GetEntityByIndex(i);\n            if (e && e->player && e->curstate.health > 0 && e->index != local->index) {\n                d[0] = e->origin[0] - local->origin[0]; d[1] = e->origin[1] - local->origin[1]; d[2] = e->origin[2] - local->origin[2];\n                float dist = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);\n                if (dist < bd && dist < 2000.0f) { bd = dist; bt = e; }\n            }\n        }\n        if (bt) {\n            d[0] = bt->origin[0] - local->origin[0]; d[1] = bt->origin[1] - local->origin[1]; d[2] = bt->origin[2] - local->origin[2];\n            float hyp = sqrt(d[0]*d[0] + d[1]*d[1]);\n            cmd->viewangles[0] = atan2(d[2], hyp) * 180.0f / M_PI;\n            cmd->viewangles[1] = atan2(d[1], d[0]) * 180.0f / M_PI;\n        }\n    }'''
           p("client/cl_dll/input/input_xash3d.cpp", "void IN_Move( float frametime, usercmd_t *cmd )\n{", n)
           p("client/cl_dll/cdll_int.cpp", 'static void LoadMenuInterface( void )\n{\n\tif( g_pMenu )\n\t\treturn;\n\n\tg_pMenu = GetNativeMenuExports();\n\tif( !g_pMenu )\n\t\tHUD_MessageBox( "Error: native object \\"MenuFactory\\" is unavailable\\n" );\n}', 'static void LoadMenuInterface( void )\n{\n\tg_pMenu = nullptr;\n}')
