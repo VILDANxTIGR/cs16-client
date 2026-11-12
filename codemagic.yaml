@@ -15,6 +15,7 @@ workflows:
           git clone https://github.com/VILDANxTIGR/xash3d-fwgs.git engine
           cd engine
           git checkout 707596f4905689ec224e993fcaa4d4ad66aa67d6
+          git submodule update --init --recursive
           cd ..
           
           SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
@@ -28,7 +29,7 @@ workflows:
           set -e
           cd engine
           mkdir -p 3rdparty
-          rm -rf 3rdparty/imgui 3rdparty/SDL 3rdparty/ffmpeg 3rdparty/mainui
+          rm -rf 3rdparty/imgui 3rdparty/SDL 3rdparty/ffmpeg
 
           # 1. ImGui
           git clone --depth 1 --branch v1.90.5 https://github.com/ocornut/imgui.git 3rdparty/imgui
@@ -38,8 +39,6 @@ workflows:
           # 3. FFmpeg
           curl -fsSL --retry 3 --retry-delay 2 -o /tmp/ffmpeg.tar.gz "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/refs/tags/n6.0"
           mkdir -p 3rdparty/ffmpeg && tar -xzf /tmp/ffmpeg.tar.gz --strip-components=1 -C 3rdparty/ffmpeg
-          # 4. MainUI
-          git clone --depth 1 https://github.com/FWGS/hlsdk-portable.git 3rdparty/mainui
 
           # Копируем ImGui в дерево движка
           mkdir -p ref/gl/imgui/backends
@@ -57,6 +56,7 @@ workflows:
           import os, re
           from pathlib import Path
 
+          # Отключаем скачивание
           deps = Path("engine/scripts/gha/deps_android.sh")
           if deps.exists():
               out = []
@@ -67,6 +67,7 @@ workflows:
                       out.append(line)
               deps.write_text("\n".join(out))
 
+          # Меню (C++)
           header = '#pragma once\n#ifdef __cplusplus\nextern "C" {\n#endif\nvoid VILDAN_Init(void);\nvoid VILDAN_DrawMenu(void);\nvoid VILDAN_ProcessTouch(int, float, float, long long);\n#ifdef __cplusplus\n}\n#endif'
           Path("engine/ref/gl/vildan_menu.h").write_text(header)
           
@@ -244,16 +245,14 @@ workflows:
           export ANDROID_HOME="$SDK"
           export ANDROID_NDK_HOME="$NDK"
           
-          cd engine
-          echo "=== Running Waf Configure ==="
-          python3 waf configure -v --disable-werror 2>&1 | tee waf-configure.log
-          
+          # Собираем движок (Gradle сам вызовет Waf configure с нужными флагами)
           echo "=== Building Engine via Gradle ==="
-          cd android
+          cd engine/android
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
           ./gradlew clean assembleDebug -Pandroid.injected.build.abi=arm64-v8a
           cd ../..
           
+          # Собираем клиент
           echo "=== Building Client ==="
           cd android
           chmod +x gradlew
