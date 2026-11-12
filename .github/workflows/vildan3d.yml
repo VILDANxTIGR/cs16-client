@@ -47,7 +47,7 @@ jobs:
           curl -fsSL --retry 3 --retry-delay 2 -o /tmp/ffmpeg.tar.gz "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/refs/tags/${FFMPEG_TAG}"
           mkdir -p 3rdparty/ffmpeg && tar -xzf /tmp/ffmpeg.tar.gz --strip-components=1 -C 3rdparty/ffmpeg
           
-          # 4. MainUI (Клонируем hlsdk-portable вручную, чтобы CMake не ругался)
+          # 4. MainUI (Клонируем вручную, чтобы не было CMake Error)
           git clone --depth 1 https://github.com/FWGS/hlsdk-portable.git 3rdparty/mainui
           
           # Копируем ImGui ВНУТРЬ дерева ref/gl/imgui
@@ -65,12 +65,11 @@ jobs:
           import os, re
           from pathlib import Path
 
-          # 1. Отключаем скачивание в deps_android.sh (кроме SDK и JDK)
+          # 1. Отключаем скачивание в deps_android.sh
           deps = Path("engine/scripts/gha/deps_android.sh")
           if deps.exists():
               out = []
               for line in deps.read_text().splitlines():
-                  # Не трогаем установку SDK/NDK, отключаем только загрузку библиотек
                   if re.search(r'(wget|curl|git clone)', line) and re.search(r'(SDL|ffmpeg|FFmpeg|mainui|hlsdk)', line, re.IGNORECASE):
                       out.append(": # [PATCHED] Skipped download: " + line.strip())
                   else:
@@ -147,7 +146,6 @@ jobs:
                   txt = p.read_text()
                   if old in txt:
                       p.write_text(txt.replace(old, new, 1))
-                      print(f"Patched: {path}")
 
           # 3. Патчи C-файлов
           patch_file("engine/ref/gl/gl_opengl.c", "#include \"../ref_api.h\"", "#include \"../ref_api.h\"\n#include \"vildan_menu.h\"")
@@ -156,53 +154,67 @@ jobs:
           patch_file("engine/ref/gl/gl_rmain.c", "R_DrawStudioModel( RI.currententity );", 'if(RI.currententity->player && gEngfuncs.pfnGetCvarPointer("vildan_esp") && gEngfuncs.pfnGetCvarPointer("vildan_esp")->value > 0.5f) { GLboolean od = pglIsEnabled(GL_DEPTH_TEST); pglDisable(GL_DEPTH_TEST); R_DrawStudioModel(RI.currententity); if(od) pglEnable(GL_DEPTH_TEST); } else R_DrawStudioModel(RI.currententity);')
           patch_file("engine/ref/gl/gl_rmain.c", "gEngfuncs.GL_SwapBuffers();", "VILDAN_DrawMenu();\n\tgEngfuncs.GL_SwapBuffers();")
 
-          # 4. ИСПРАВЛЕННЫЙ ПАТЧ WSCRIPT (Убираем NameError)
+          # 4. ПАТЧ WSCRIPT (Точный байтовый патч от GPT-4 Sol)
           w_path = Path("engine/ref/gl/wscript")
           if w_path.exists():
-              w = w_path.read_text()
-              if "menu_source" not in w:
-                  # Ищем оригинальный вызов bld.shlib
-                  old_shlib = "bld.shlib(source = source,\n\t\t\ttarget = k,\n\t\t\tincludes = includes,\n\t\t\tfeatures = 'format',\n\t\t\tuse = libs + v['libs'],\n\t\t\tdefines = v['defines'] + ['REF_DLL=1'],\n\t\t\tinstall_path = bld.env.LIBDIR)"
-                  
-                  # Заменяем на безопасный вариант
-                  new_shlib = """menu_source = source
-          menu_features = 'format'
-          menu_defines = v['defines'] + ['REF_DLL=1']
-
-          if bld.env.DEST_OS == 'android' and k in ('ref_gles3compat', 'ref_gl4es'):
-              extra_files = [
-                  'imgui/imgui.cpp',
-                  'imgui/imgui_draw.cpp',
-                  'imgui/imgui_tables.cpp',
-                  'imgui/imgui_widgets.cpp',
-                  'imgui/backends/imgui_impl_opengl3.cpp',
-                  'vildan_menu.cpp',
+              w_bytes = w_path.read_bytes()
+              def line(level, text):
+                  return ('\t' * level + text + '\n').encode('utf-8')
+              old = b''.join([
+                  line(2, 'bld.shlib(source = source,'),
+                  line(3, 'target = k,'),
+                  line(3, 'includes = includes,'),
+                  line(3, "features = 'format',"),
+                  line(3, "use = libs + v['libs'],"),
+                  line(3, "defines = v['defines'] + ['REF_DLL=1'],"),
+                  line(3, 'install_path = bld.env.LIBDIR)'),
+              ])
+              replacement = [
+                  (2, 'menu_source = source'),
+                  (2, 'menu_includes = includes'),
+                  (2, "menu_defines = v['defines'] + ['REF_DLL=1']"),
+                  (2, 'menu_lib = []'),
+                  (2, "menu_features = 'format'"),
+                  (0, ''),
+                  (2, "if bld.env.DEST_OS == 'android' and k in ('ref_gles3compat', 'ref_gl4es'):"),
+                  (3, 'extra_files = ['),
+                  (4, "'imgui/imgui.cpp',"),
+                  (4, "'imgui/imgui_draw.cpp',"),
+                  (4, "'imgui/imgui_tables.cpp',"),
+                  (4, "'imgui/imgui_widgets.cpp',"),
+                  (4, "'imgui/backends/imgui_impl_opengl3.cpp',"),
+                  (4, "'vildan_menu.cpp',"),
+                  (3, ']'),
+                  (3, 'extra_nodes = []'),
+                  (3, 'for filename in extra_files:'),
+                  (4, 'node = bld.path.find_node(filename)'),
+                  (4, 'if node is None:'),
+                  (5, "bld.fatal('ref/gl: missing source file: ' + filename)"),
+                  (4, 'extra_nodes.append(node)'),
+                  (0, ''),
+                  (3, 'menu_source = source + extra_nodes'),
+                  (3, "menu_includes = ['.', 'imgui', 'imgui/backends']"),
+                  (3, "menu_defines += ['IMGUI_IMPL_OPENGL_ES2']"),
+                  (3, "menu_lib = ['GLESv2']"),
+                  (3, "menu_features = 'cxx format'"),
+                  (0, ''),
+                  (2, 'bld.shlib(source = menu_source,'),
+                  (3, 'target = k,'),
+                  (3, 'includes = menu_includes,'),
+                  (3, 'features = menu_features,'),
+                  (3, "use = libs + v['libs'],"),
+                  (3, 'defines = menu_defines,'),
+                  (3, 'lib = menu_lib,'),
+                  (3, 'install_path = bld.env.LIBDIR)'),
               ]
-              extra_nodes = []
-              for filename in extra_files:
-                  node = bld.path.find_node(filename)
-                  if node is None:
-                      bld.fatal('ref/gl: missing source file: ' + filename)
-                  extra_nodes.append(node)
-
-              menu_source = source + extra_nodes
-              menu_features = 'cxx format'
-              menu_defines += ['IMGUI_IMPL_OPENGL_ES2']
-
-          bld.shlib(source = menu_source,
-              target = k,
-              includes = ['.', 'imgui', 'imgui/backends'],
-              features = menu_features,
-              use = libs + v['libs'],
-              defines = menu_defines,
-              lib = ['GLESv2'] if bld.env.DEST_OS == 'android' else [],
-              install_path = bld.env.LIBDIR)"""
-                  if old_shlib in w:
-                      w = w.replace(old_shlib, new_shlib)
-                      w_path.write_text(w)
-                      print("Wscript patched successfully (fixed NameError).")
-                  else:
-                      print("Warning: wscript structure changed, skip patch.")
+              new_bytes = b''.join(line(level, text) for level, text in replacement)
+              if w_bytes.count(old) == 1:
+                  updated = w_bytes.replace(old, new_bytes)
+                  compile(updated.decode('utf-8'), str(w_path), 'exec')
+                  w_path.write_bytes(updated)
+                  print("Wscript patched successfully (byte-level).")
+              else:
+                  print("Wscript structure differs, skipping patch.")
 
           # 5. Патч IN_Move
           in_path = Path("client/cl_dll/input/input_xash3d.cpp")
