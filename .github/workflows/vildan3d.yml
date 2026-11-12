@@ -21,7 +21,7 @@ jobs:
       - name: Deps / NDK
         run: |
           set -euo pipefail
-          sudo apt-get update -qq && sudo apt-get install -y -qq cmake ninja-build unzip curl xz-utils python3
+          sudo apt-get update -qq && sudo apt-get install -y -qq cmake ninja-build unzip curl xz-utils python3 git
           SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
           "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${NDK_VERSION}" >/dev/null
@@ -34,15 +34,22 @@ jobs:
           set -euo pipefail
           cd engine
           mkdir -p 3rdparty
-          rm -rf 3rdparty/imgui 3rdparty/SDL 3rdparty/ffmpeg
+          rm -rf 3rdparty/imgui 3rdparty/SDL 3rdparty/ffmpeg 3rdparty/mainui
 
-          # Скачиваем зависимости
+          # 1. ImGui
           git clone --depth 1 --branch "${IMGUI_TAG}" https://github.com/ocornut/imgui.git 3rdparty/imgui
+          
+          # 2. SDL
           curl -fsSL --retry 3 --retry-delay 2 -o /tmp/sdl2.tar.gz "https://github.com/libsdl-org/SDL/archive/refs/tags/${SDL_TAG}.tar.gz"
           mkdir -p 3rdparty/SDL && tar -xzf /tmp/sdl2.tar.gz --strip-components=1 -C 3rdparty/SDL
+          
+          # 3. FFmpeg
           curl -fsSL --retry 3 --retry-delay 2 -o /tmp/ffmpeg.tar.gz "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/refs/tags/${FFMPEG_TAG}"
           mkdir -p 3rdparty/ffmpeg && tar -xzf /tmp/ffmpeg.tar.gz --strip-components=1 -C 3rdparty/ffmpeg
-
+          
+          # 4. MainUI (Клонируем hlsdk-portable вручную, чтобы CMake не ругался)
+          git clone --depth 1 https://github.com/FWGS/hlsdk-portable.git 3rdparty/mainui
+          
           # Копируем ImGui ВНУТРЬ дерева ref/gl/imgui
           mkdir -p ref/gl/imgui/backends
           cp 3rdparty/imgui/imgui.cpp 3rdparty/imgui/imgui.h 3rdparty/imgui/imgui_internal.h 3rdparty/imgui/imconfig.h ref/gl/imgui/
@@ -58,19 +65,20 @@ jobs:
           import os, re
           from pathlib import Path
 
-          # 1. Отключаем скачивание в deps_android.sh
+          # 1. Отключаем скачивание в deps_android.sh (кроме SDK и JDK)
           deps = Path("engine/scripts/gha/deps_android.sh")
           if deps.exists():
               out = []
               for line in deps.read_text().splitlines():
-                  if re.search(r'(wget|curl)', line) and re.search(r'(SDL|ffmpeg|FFmpeg)', line, re.IGNORECASE):
+                  # Не трогаем установку SDK/NDK, отключаем только загрузку библиотек
+                  if re.search(r'(wget|curl|git clone)', line) and re.search(r'(SDL|ffmpeg|FFmpeg|mainui|hlsdk)', line, re.IGNORECASE):
                       out.append(": # [PATCHED] Skipped download: " + line.strip())
                   else:
                       out.append(line)
               deps.write_text("\n".join(out))
               os.system("bash -n engine/scripts/gha/deps_android.sh")
 
-          # 2. Генерация vildan_menu.h и .cpp в ref/gl/
+          # 2. Генерация vildan_menu.h и .cpp
           header = '#pragma once\n#ifdef __cplusplus\nextern "C" {\n#endif\nvoid VILDAN_Init(void);\nvoid VILDAN_DrawMenu(void);\nvoid VILDAN_ProcessTouch(int, float, float, long long);\n#ifdef __cplusplus\n}\n#endif'
           Path("engine/ref/gl/vildan_menu.h").write_text(header)
           
@@ -148,17 +156,18 @@ jobs:
           patch_file("engine/ref/gl/gl_rmain.c", "R_DrawStudioModel( RI.currententity );", 'if(RI.currententity->player && gEngfuncs.pfnGetCvarPointer("vildan_esp") && gEngfuncs.pfnGetCvarPointer("vildan_esp")->value > 0.5f) { GLboolean od = pglIsEnabled(GL_DEPTH_TEST); pglDisable(GL_DEPTH_TEST); R_DrawStudioModel(RI.currententity); if(od) pglEnable(GL_DEPTH_TEST); } else R_DrawStudioModel(RI.currententity);')
           patch_file("engine/ref/gl/gl_rmain.c", "gEngfuncs.GL_SwapBuffers();", "VILDAN_DrawMenu();\n\tgEngfuncs.GL_SwapBuffers();")
 
-          # 4. Патч WSCRIPT (от GPT Sol 6)
+          # 4. ИСПРАВЛЕННЫЙ ПАТЧ WSCRIPT (Убираем NameError)
           w_path = Path("engine/ref/gl/wscript")
           if w_path.exists():
               w = w_path.read_text()
               if "menu_source" not in w:
+                  # Ищем оригинальный вызов bld.shlib
                   old_shlib = "bld.shlib(source = source,\n\t\t\ttarget = k,\n\t\t\tincludes = includes,\n\t\t\tfeatures = 'format',\n\t\t\tuse = libs + v['libs'],\n\t\t\tdefines = v['defines'] + ['REF_DLL=1'],\n\t\t\tinstall_path = bld.env.LIBDIR)"
+                  
+                  # Заменяем на безопасный вариант
                   new_shlib = """menu_source = source
-          menu_includes = includes
-          menu_defines = v['defines'] + ['REF_DLL=1']
-          menu_lib = []
           menu_features = 'format'
+          menu_defines = v['defines'] + ['REF_DLL=1']
 
           if bld.env.DEST_OS == 'android' and k in ('ref_gles3compat', 'ref_gl4es'):
               extra_files = [
@@ -177,23 +186,21 @@ jobs:
                   extra_nodes.append(node)
 
               menu_source = source + extra_nodes
-              menu_includes = ['.', 'imgui', 'imgui/backends']
-              menu_defines += ['IMGUI_IMPL_OPENGL_ES2']
-              menu_lib = ['GLESv2']
               menu_features = 'cxx format'
+              menu_defines += ['IMGUI_IMPL_OPENGL_ES2']
 
           bld.shlib(source = menu_source,
               target = k,
-              includes = menu_includes,
+              includes = ['.', 'imgui', 'imgui/backends'],
               features = menu_features,
               use = libs + v['libs'],
               defines = menu_defines,
-              lib = menu_lib,
+              lib = ['GLESv2'] if bld.env.DEST_OS == 'android' else [],
               install_path = bld.env.LIBDIR)"""
                   if old_shlib in w:
                       w = w.replace(old_shlib, new_shlib)
                       w_path.write_text(w)
-                      print("Wscript patched successfully.")
+                      print("Wscript patched successfully (fixed NameError).")
                   else:
                       print("Warning: wscript structure changed, skip patch.")
 
