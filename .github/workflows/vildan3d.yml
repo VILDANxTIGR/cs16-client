@@ -39,13 +39,12 @@ jobs:
           # ImGui
           git clone --depth 1 --branch "${IMGUI_TAG}" https://github.com/ocornut/imgui.git 3rdparty/imgui
 
-          # SDL2 (Клод сказал, что Xash3d ждет SDL2, но скрипт проверяет SDL - делаем симлинк)
+          # SDL2 (Клод сказал, что wscript ждет SDL, качаем сразу туда)
           curl -fsSL --retry 3 --retry-delay 2 -o /tmp/sdl2.tar.gz "https://github.com/libsdl-org/SDL/archive/refs/tags/${SDL_TAG}.tar.gz"
-          mkdir -p 3rdparty/SDL2
-          tar -xzf /tmp/sdl2.tar.gz --strip-components=1 -C 3rdparty/SDL2
-          ln -s SDL2 3rdparty/SDL
+          mkdir -p 3rdparty/SDL
+          tar -xzf /tmp/sdl2.tar.gz --strip-components=1 -C 3rdparty/SDL
 
-          # FFmpeg (скачиваем исходники)
+          # FFmpeg
           curl -fsSL --retry 3 --retry-delay 2 -o /tmp/ffmpeg.tar.gz "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/refs/tags/${FFMPEG_TAG}"
           mkdir -p 3rdparty/ffmpeg
           tar -xzf /tmp/ffmpeg.tar.gz --strip-components=1 -C 3rdparty/ffmpeg
@@ -57,7 +56,7 @@ jobs:
           import os, re
           from pathlib import Path
 
-          # 1. Отключаем скачивание в deps_android.sh (замена на no-op ":")
+          # 1. Отключаем скачивание в deps_android.sh (с проверкой синтаксиса bash)
           deps = Path("engine/scripts/gha/deps_android.sh")
           if deps.exists():
               out = []
@@ -67,9 +66,10 @@ jobs:
                   else:
                       out.append(line)
               deps.write_text("\n".join(out))
-              print("deps_android.sh patched.")
+              os.system("bash -n engine/scripts/gha/deps_android.sh") # Проверка синтаксиса
+              print("deps_android.sh patched & syntax checked.")
 
-          # 2. Генерация ImGui меню
+          # 2. Генерация ImGui меню (ЧИТЫ НА МЕСТЕ)
           Path("engine/ref/gl/vildan_menu.h").write_text('#pragma once\n#ifdef __cplusplus\nextern "C" {\n#endif\nvoid VILDAN_Init(void);\nvoid VILDAN_DrawMenu(void);\nvoid VILDAN_ProcessTouch(int, float, float, long long);\n#ifdef __cplusplus\n}\n#endif')
           
           cpp = r'''#include "vildan_menu.h"
@@ -137,21 +137,45 @@ jobs:
                   txt = p.read_text()
                   if old in txt:
                       p.write_text(txt.replace(old, new, 1))
+                      print(f"Patched: {path}")
+                  else:
+                      print(f"Warning: anchor not found in {path}")
 
-          # 3. Патчи движка (Исправлено по совету Клода: добавляем, а не заменяем)
+          # 3. Патчи движка (Исправлено: добавляем, а не заменяем)
           patch_file("engine/ref/gl/gl_opengl.c", "#include \"../ref_api.h\"", "#include \"../ref_api.h\"\n#include \"vildan_menu.h\"")
           patch_file("engine/ref/gl/gl_rmain.c", "#include \"../ref_api.h\"", "#include \"../ref_api.h\"\n#include \"vildan_menu.h\"")
           
-          # ТОЧКА ВЫЗОВА (Не заменяем, а добавляем после!)
           patch_file("engine/ref/gl/gl_opengl.c", "GL_OnContextCreated();", "GL_OnContextCreated();\n\tVILDAN_Init();")
           patch_file("engine/ref/gl/gl_rmain.c", "R_DrawStudioModel( RI.currententity );", 'if(RI.currententity->player && gEngfuncs.pfnGetCvarPointer("vildan_esp") && gEngfuncs.pfnGetCvarPointer("vildan_esp")->value > 0.5f) { GLboolean od = pglIsEnabled(GL_DEPTH_TEST); pglDisable(GL_DEPTH_TEST); R_DrawStudioModel(RI.currententity); if(od) pglEnable(GL_DEPTH_TEST); } else R_DrawStudioModel(RI.currententity);')
           patch_file("engine/ref/gl/gl_rmain.c", "gEngfuncs.GL_SwapBuffers();", "VILDAN_DrawMenu();\n\tgEngfuncs.GL_SwapBuffers();")
 
-          # 4. Патч wscript (Исправлено: расширяем INCLUDES, а не перезаписываем includes)
-          patch_file("engine/ref/gl/wscript", "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])", "source = bld.path.ant_glob(['*.c', 'gl2_shim/*.c'])\n\ti = bld.srcnode.find_dir('3rdparty/imgui')\n\ts = bld.srcnode.find_dir('3rdparty/SDL/include')\n\tsource += [bld.path.find_node('vildan_menu.cpp'), i.find_node('imgui.cpp'), i.find_node('imgui_draw.cpp'), i.find_node('imgui_tables.cpp'), i.find_node('imgui_widgets.cpp'), i.find_node('backends/imgui_impl_opengl3.cpp')]\n\tbld.env.INCLUDES += [i.abspath(), i.find_dir('backends').abspath(), s.abspath()]")
-          patch_file("engine/ref/gl/wscript", "bld.shlib(source = source,", "bld(features = 'cxxshlib', lib = ['GLESv2'], source = source,")
+          # 4. БЕЗОПАСНЫЙ ПАТЧ WSCRIPT (Как советовал Клод: monkeypatch bld.shlib)
+          w_path = Path("engine/ref/gl/wscript")
+          if w_path.exists():
+              w = w_path.read_text()
+              if "VILDAN_UI_LIB" not in w:
+                  patch_code = '''
+          # --- VILDAN UI INJECTION ---
+          _orig_shlib = bld.shlib
+          _imgui = bld.srcnode.find_dir('3rdparty/imgui')
+          _sdl = bld.srcnode.find_dir('3rdparty/SDL/include')
+          _ui_src = [_imgui.find_node(x) for x in ('imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp', 'backends/imgui_impl_opengl3.cpp')]
+          _ui_src.append(bld.path.find_node('vildan_menu.cpp'))
+          _ui_inc = [_imgui.abspath(), _imgui.find_dir('backends').abspath(), _sdl.abspath()]
+          
+          bld.stlib(features='cxx', target='VILDAN_UI_LIB', source=_ui_src, includes=_ui_inc, defines=['IMGUI_IMPL_OPENGL_ES2'])
+          
+          def _vildan_shlib(*args, **kwargs):
+              kwargs['use'] = list(kwargs.get('use') or []) + ['VILDAN_UI_LIB']
+              return _orig_shlib(*args, **kwargs)
+          bld.shlib = _vildan_shlib
+          # ---------------------------
+          '''
+                  w = w.replace("def build(bld):", "def build(bld):\n" + patch_code)
+                  w_path.write_text(w)
+                  print("Wscript patched safely (monkeypatch).")
 
-          # 5. Патч клиента (Исправлено по совету Клода: хелпер сверху + вызов внутри IN_Move)
+          # 5. БЕЗОПАСНЫЙ ПАТЧ IN_MOVE (Как советовал Клод)
           in_path = Path("client/cl_dll/input/input_xash3d.cpp")
           if in_path.exists():
               in_txt = in_path.read_text()
@@ -182,8 +206,7 @@ jobs:
           }
           '''
               marker = "void IN_Move( float frametime, usercmd_t *cmd )\n{"
-              if marker in in_txt:
-                  # Вставляем хелпер перед функцией и вызов внутри
+              if marker in in_txt and "vildan_move_fix" not in in_txt:
                   in_txt = in_txt.replace(marker, helper + "\n" + marker + "\n    vildan_move_fix(cmd);", 1)
                   in_path.write_text(in_txt)
                   print("IN_Move patched correctly.")
@@ -196,15 +219,14 @@ jobs:
         run: |
           set -euo pipefail
           cd engine
-          # Убираем sed для ANDROID_HOME, Клод сказал это ломает пути
           sed -i 's/ANDROID_NDK_VERSION=.*/ANDROID_NDK_VERSION="28.2.13676358"/' scripts/gha/deps_android.sh
           sed -i 's/ndkVersion = .*/ndkVersion = "28.2.13676358"/' android/app/build.gradle.kts
           sed -i 's/setOf("armeabi-v7a", "arm64-v8a", "x86")/setOf("arm64-v8a")/' android/app/build.gradle.kts
           
-          # Запускаем скрипт. Пути ANDROID_HOME уже в $GITHUB_ENV, ничего не переопределяем.
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/deps_android.sh
           
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
+          # Запускаем сборку. Waf теперь должен сгенерировать build.ninja без ошибок.
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/build_android.sh
           
           cd ../client/android
@@ -216,8 +238,8 @@ jobs:
         if: always()
         run: |
           mkdir -p out/apk
-          find engine/android/app/build/outputs/apk -name "*.apk" | head -n 1 | xargs -I {} cp {} out/apk/VILDAN3D_Engine.apk || true
-          find client/android/app/build/outputs/apk -name "*.apk" | head -n 1 | xargs -I {} cp {} out/apk/VILDAN3D_Client.apk || true
+          find engine -name "*.apk" | head -n 1 | xargs -I {} cp {} out/apk/VILDAN3D_Engine.apk || true
+          find client -name "*.apk" | head -n 1 | xargs -I {} cp {} out/apk/VILDAN3D_Client.apk || true
 
       - uses: actions/upload-artifact@v4
         if: always()
