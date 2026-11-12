@@ -147,8 +147,8 @@ jobs:
           if w_path.exists():
               w = w_path.read_text()
               if "VILDAN_UI_LIB" not in w:
-                  patch_code = '''
-          # --- VILDAN UI INJECTION ---
+                  # ИСПРАВЛЕНИЕ: Добавляем 4 пробела в начало каждой строки патча, чтобы не было IndentationError
+                  patch_code_raw = '''# --- VILDAN UI INJECTION ---
           _orig_shlib = bld.shlib
           _imgui = bld.srcnode.find_dir('3rdparty/imgui')
           _sdl = bld.srcnode.find_dir('3rdparty/SDL/include')
@@ -162,8 +162,11 @@ jobs:
               kwargs['use'] = list(kwargs.get('use') or []) + ['VILDAN_UI_LIB']
               return _orig_shlib(*args, **kwargs)
           bld.shlib = _vildan_shlib
-          # ---------------------------
-          '''
+          # ---------------------------'''
+                  
+                  # Автоматически выравниваем отступы
+                  patch_code = "\n".join(["    " + line.strip() for line in patch_code_raw.strip().split("\n")])
+                  
                   w = w.replace("def build(bld):", "def build(bld):\n" + patch_code)
                   w_path.write_text(w)
                   print("Wscript patched safely (monkeypatch).")
@@ -216,11 +219,6 @@ jobs:
           sed -i 's/setOf("armeabi-v7a", "arm64-v8a", "x86")/setOf("arm64-v8a")/' android/app/build.gradle.kts
 
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/deps_android.sh
-
-          # ДИАГНОСТИКА WAF
-          echo "=== DIAGNOSTICS: waf configure verbose ==="
-          python3 waf configure -v --disable-werror --enable-lto=no 2>&1 || true
-          echo "=== END DIAGNOSTICS ==="
 
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/build_android.sh
