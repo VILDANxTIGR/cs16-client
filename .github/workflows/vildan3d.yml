@@ -20,16 +20,18 @@ jobs:
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install "ndk;${NDK_VERSION}" > /dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> $GITHUB_ENV
-      - name: Setup ImGui & SDL
+      - name: Setup ImGui, SDL & FFmpeg
         run: |
-          rm -rf engine/3rdparty/imgui
+          rm -rf engine/3rdparty/imgui engine/3rdparty/SDL engine/3rdparty/ffmpeg
           git clone --depth 1 --branch v1.90.5 https://github.com/ocornut/imgui.git engine/3rdparty/imgui
           
-          # Качаем SDL2 вручную по совету Джипити
+          # Качаем SDL2 вручную
           mkdir -p engine/3rdparty/SDL
           curl -fL "https://codeload.github.com/libsdl-org/SDL/tar.gz/refs/tags/release-2.30.0" -o /tmp/SDL2.tar.gz
           tar -xzf /tmp/SDL2.tar.gz --strip-components=1 -C engine/3rdparty/SDL
-          test -f engine/3rdparty/SDL/CMakeLists.txt
+          
+          # Качаем FFmpeg вручную (версия n6.0)
+          git clone --depth 1 --branch n6.0 https://github.com/FFmpeg/FFmpeg.git engine/3rdparty/ffmpeg
       - name: Patch All
         shell: bash
         run: |
@@ -41,10 +43,14 @@ jobs:
               txt = path.read_text()
               if o in txt: path.write_text(txt.replace(o, n, 1))
 
-          # 1. Патч скрипта deps_android.sh (чтобы не качал битую SDL)
+          # 1. Патчим deps_android.sh для SDL и FFmpeg
           p("engine/scripts/gha/deps_android.sh", 
             'echo "Download SDL"\npushd 3rdparty || exit 1\nwget "https://github.com/libsdl-org/SDL/releases/download/release-$SDL_VERSION/SDL2-$SDL_VERSION.tar.gz" -qO- | tar -xzf - || exit 1\nmv "SDL2-$SDL_VERSION" SDL\npopd || exit 1', 
             'if [ ! -f 3rdparty/SDL/CMakeLists.txt ]; then\n    echo "Download SDL"\n    pushd 3rdparty || exit 1\n    wget "https://github.com/libsdl-org/SDL/releases/download/release-$SDL_VERSION/SDL2-$SDL_VERSION.tar.gz" -qO- | tar -xzf - || exit 1\n    mv "SDL2-$SDL_VERSION" SDL\n    popd || exit 1\nelse\n    echo "SDL2 already exists, skipping download"\nfi')
+          
+          p("engine/scripts/gha/deps_android.sh", 
+            'echo "Download FFMpeg"\npushd 3rdparty || exit 1\nwget "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n$FFMPEG_VERSION.tar.gz" -qO- | tar -xzf - || exit 1\nmv "FFmpeg-n$FFMPEG_VERSION" ffmpeg\npopd || exit 1', 
+            'if [ ! -d 3rdparty/ffmpeg ]; then\n    echo "Download FFMpeg"\n    pushd 3rdparty || exit 1\n    wget "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n$FFMPEG_VERSION.tar.gz" -qO- | tar -xzf - || exit 1\n    mv "FFmpeg-n$FFMPEG_VERSION" ffmpeg\n    popd || exit 1\nelse\n    echo "FFmpeg already exists, skipping download"\nfi')
 
           # 2. Генерация ImGui меню
           Path("engine/ref/gl/vildan_menu.h").write_text('#pragma once\n#ifdef __cplusplus\nextern "C" {\n#endif\nvoid VILDAN_Init(void);\nvoid VILDAN_DrawMenu(void);\nvoid VILDAN_ProcessTouch(int, float, float, long long);\n#ifdef __cplusplus\n}\n#endif')
