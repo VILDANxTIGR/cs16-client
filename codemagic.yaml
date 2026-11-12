@@ -5,8 +5,6 @@ workflows:
     instance_type: mac_mini_m2
     environment:
       java: 21
-      vars:
-        NDK_VERSION: "28.2.13676358"
     scripts:
       - name: Clone Engine and Setup Deps
         script: |
@@ -18,11 +16,16 @@ workflows:
           git submodule update --init --recursive
           cd ..
           
-          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
-          "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${NDK_VERSION}" > /dev/null
-          export ANDROID_NDK_HOME="$SDK/ndk/${NDK_VERSION}"
-          brew install cmake ninja unzip curl xz python3 > /dev/null 2>&1 || true
+          # Gradle берёт NDK из build.gradle.kts
+          ENGINE_NDK=$(grep -o 'ndkVersion = "[^"]*"' engine/android/app/build.gradle.kts | cut -d'"' -f2)
+          SDK="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+          export ANDROID_HOME="$SDK"
+          unset ANDROID_SDK_ROOT
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" "ndk;$ENGINE_NDK" > /dev/null
+          export ANDROID_NDK_HOME="$SDK/ndk/$ENGINE_NDK"
+
+          command -v cmake >/dev/null || brew install cmake
+          command -v ninja >/dev/null || brew install ninja
 
       - name: Download and Patch Dependencies
         script: |
@@ -49,9 +52,67 @@ workflows:
           cp 3rdparty/imgui/backends/imgui_impl_opengl3_loader.h ref/gl/imgui/backends/
           cd ..
 
-      - name: Patch Source Code
+      - name: Patch Source Code & Fix Waf Scripts
         script: |
           set -e
+          mkdir -p ci
+          
+          # 1. Создаем патч для configure-ninja.py (от Perplexity)
+          cat << 'PATCH_EOF' > ci/patch_configure_ninja.py
+          import sys, io, re
+          p = sys.argv[1]
+          s = io.open(p, encoding="utf-8").read()
+
+          helper = '''
+          def _run_logged(cmd, log_path, env=None, cwd=None):
+              sys.stderr.write("\\n[configure-ninja] $ {}\\n".format(" ".join(cmd)))
+              sys.stderr.flush()
+              try:
+                  p = subprocess.Popen(cmd, env=env, cwd=cwd, stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT, universal_newlines=True)
+              except OSError as e:
+                  sys.stderr.write("[configure-ninja] cannot start {}: {}\\n".format(cmd[0], e))
+                  sys.exit(127)
+              with io.open(log_path, "a", encoding="utf-8") as log:
+                  for line in p.stdout:
+                      sys.stderr.write(line)
+                      log.write(line)
+              p.wait()
+              if p.returncode != 0:
+                  sys.stderr.write("\\n[configure-ninja] FAILED (exit {}): {}\\n".format(p.returncode, " ".join(cmd)))
+                  sys.stderr.write("[configure-ninja] full log: {}\\n".format(log_path))
+                  sys.stderr.flush()
+                  sys.exit(p.returncode)
+
+          '''
+          s = s.replace("\\ndef check_repo(", helper + "\\ndef check_repo(", 1)
+
+          s = s.replace('''\tcmake_process = subprocess.Popen(cmake_exec)
+          \tcmake_process.communicate()''',
+          '''\t_run_logged(cmake_exec, os.path.join(os.path.dirname(out), "configure-ninja.log"))''')
+
+          s = s.replace('''\tprocess = subprocess.Popen(waf_exec, env=env)
+          \tprocess.communicate()
+          ''', '''\tlog_path = os.path.join(args.configuration_dir, "configure-ninja.log")
+          \ttry:
+          \t\t_run_logged(waf_exec, log_path, env=env, cwd=args.wscript_path)
+          \texcept SystemExit:
+          \t\tcfg = os.path.join(out_path, "config.log")
+          \t\tif os.path.exists(cfg):
+          \t\t\tsys.stderr.write("\\n===== waf config.log (tail) =====\\n")
+          \t\t\twith io.open(cfg, encoding="utf-8", errors="replace") as f:
+          \t\t\t\tsys.stderr.write("".join(f.readlines()[-300:]))
+          \t\traise
+
+          \tif not os.path.isfile(os.path.join(out_path, "build.ninja")):
+          \t\tsys.stderr.write("[configure-ninja] waf finished but build.ninja is missing\\n")
+          \t\tsys.exit(1)
+          ''')
+          io.open(p, "w", encoding="utf-8").write(s)
+          print("configure-ninja.py patched")
+          PATCH_EOF
+
+          # 2. Применяем наш патч к wscript и создаем меню (без изменений)
           python3 << 'PYEOF'
           import os, re
           from pathlib import Path
@@ -236,24 +297,39 @@ workflows:
 
           patch_file("cl_dll/cdll_int.cpp", 'static void LoadMenuInterface( void )\n{\n\tif( g_pMenu )\n\t\treturn;\n\n\tg_pMenu = GetNativeMenuExports();\n\tif( !g_pMenu )\n\t\tHUD_MessageBox( "Error: native object \\"MenuFactory\\" is unavailable\\n" );\n}', 'static void LoadMenuInterface( void )\n{\n\tg_pMenu = nullptr;\n}')
           PYEOF
+          
+          # Применяем патч от Перплексити
+          cd engine
+          chmod +x waf android/gradlew android/app/run-python
+          printf '#!/bin/bash\nexec python3 "$@"\n' > android/app/run-python
+          python3 ../ci/patch_configure_ninja.py scripts/configure-ninja.py
+          cd ..
 
       - name: Build Engine and Client
         script: |
-          set -e
-          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          NDK="$SDK/ndk/${NDK_VERSION}"
+          set -euo pipefail
+          ENGINE_NDK=$(grep -o 'ndkVersion = "[^"]*"' engine/android/app/build.gradle.kts | cut -d'"' -f2)
+          SDK="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
           export ANDROID_HOME="$SDK"
-          export ANDROID_NDK_HOME="$NDK"
+          export ANDROID_NDK_HOME="$SDK/ndk/$ENGINE_NDK"
+          export ANDROID_NDK="$ANDROID_NDK_HOME"
+
+          cd engine
           
-          # Собираем движок (Gradle сам вызовет Waf configure с нужными флагами)
-          echo "=== Building Engine via Gradle ==="
-          cd engine/android
-          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
-          ./gradlew clean assembleDebug -Pandroid.injected.build.abi=arm64-v8a
-          cd ../..
+          # Ручной запуск waf configure для диагностики (если упадет - покажет лог)
+          WAFLOCK=.lock-waf_android_arm64-v8a_manual python3 ./waf configure \
+            -t . -o build-android-arm64 -T debug \
+            --android=arm64-v8a,,21 \
+            -s 3rdparty/SDL --skip-sdl2-sanity-check --enable-bundled-deps \
+            --enable-ffmpeg --enable-ffmpeg-dlopen --ffmpeg-dir=3rdparty/ffmpeg \
+            ninja || { echo '===== config.log ====='; tail -n 300 build-android-arm64/config.log; exit 1; }
           
-          # Собираем клиент
-          echo "=== Building Client ==="
+          # Запуск сборки через Gradle
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
+          (cd android && ./gradlew assembleDebug --no-daemon --stacktrace -Pandroid.injected.build.abi=arm64-v8a)
+          cd ..
+
+          # Сборка клиента
           cd android
           chmod +x gradlew
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
@@ -262,3 +338,5 @@ workflows:
     artifacts:
       - engine/android/app/build/outputs/apk/**/*.apk
       - android/app/build/outputs/apk/**/*.apk
+      - engine/android/app/.cxx/**/configure-ninja.log
+      - engine/build-android-arm64/config.log
