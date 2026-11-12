@@ -36,15 +36,12 @@ jobs:
           mkdir -p 3rdparty
           rm -rf 3rdparty/imgui 3rdparty/SDL 3rdparty/SDL2 3rdparty/ffmpeg
 
-          # ImGui
           git clone --depth 1 --branch "${IMGUI_TAG}" https://github.com/ocornut/imgui.git 3rdparty/imgui
 
-          # SDL2 (Клод сказал, что wscript ждет SDL, качаем сразу туда)
           curl -fsSL --retry 3 --retry-delay 2 -o /tmp/sdl2.tar.gz "https://github.com/libsdl-org/SDL/archive/refs/tags/${SDL_TAG}.tar.gz"
           mkdir -p 3rdparty/SDL
           tar -xzf /tmp/sdl2.tar.gz --strip-components=1 -C 3rdparty/SDL
 
-          # FFmpeg
           curl -fsSL --retry 3 --retry-delay 2 -o /tmp/ffmpeg.tar.gz "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/refs/tags/${FFMPEG_TAG}"
           mkdir -p 3rdparty/ffmpeg
           tar -xzf /tmp/ffmpeg.tar.gz --strip-components=1 -C 3rdparty/ffmpeg
@@ -56,7 +53,6 @@ jobs:
           import os, re
           from pathlib import Path
 
-          # 1. Отключаем скачивание в deps_android.sh (с проверкой синтаксиса bash)
           deps = Path("engine/scripts/gha/deps_android.sh")
           if deps.exists():
               out = []
@@ -66,10 +62,9 @@ jobs:
                   else:
                       out.append(line)
               deps.write_text("\n".join(out))
-              os.system("bash -n engine/scripts/gha/deps_android.sh") # Проверка синтаксиса
+              os.system("bash -n engine/scripts/gha/deps_android.sh")
               print("deps_android.sh patched & syntax checked.")
 
-          # 2. Генерация ImGui меню (ЧИТЫ НА МЕСТЕ)
           Path("engine/ref/gl/vildan_menu.h").write_text('#pragma once\n#ifdef __cplusplus\nextern "C" {\n#endif\nvoid VILDAN_Init(void);\nvoid VILDAN_DrawMenu(void);\nvoid VILDAN_ProcessTouch(int, float, float, long long);\n#ifdef __cplusplus\n}\n#endif')
           
           cpp = r'''#include "vildan_menu.h"
@@ -141,7 +136,6 @@ jobs:
                   else:
                       print(f"Warning: anchor not found in {path}")
 
-          # 3. Патчи движка (Исправлено: добавляем, а не заменяем)
           patch_file("engine/ref/gl/gl_opengl.c", "#include \"../ref_api.h\"", "#include \"../ref_api.h\"\n#include \"vildan_menu.h\"")
           patch_file("engine/ref/gl/gl_rmain.c", "#include \"../ref_api.h\"", "#include \"../ref_api.h\"\n#include \"vildan_menu.h\"")
           
@@ -149,7 +143,6 @@ jobs:
           patch_file("engine/ref/gl/gl_rmain.c", "R_DrawStudioModel( RI.currententity );", 'if(RI.currententity->player && gEngfuncs.pfnGetCvarPointer("vildan_esp") && gEngfuncs.pfnGetCvarPointer("vildan_esp")->value > 0.5f) { GLboolean od = pglIsEnabled(GL_DEPTH_TEST); pglDisable(GL_DEPTH_TEST); R_DrawStudioModel(RI.currententity); if(od) pglEnable(GL_DEPTH_TEST); } else R_DrawStudioModel(RI.currententity);')
           patch_file("engine/ref/gl/gl_rmain.c", "gEngfuncs.GL_SwapBuffers();", "VILDAN_DrawMenu();\n\tgEngfuncs.GL_SwapBuffers();")
 
-          # 4. БЕЗОПАСНЫЙ ПАТЧ WSCRIPT (Как советовал Клод: monkeypatch bld.shlib)
           w_path = Path("engine/ref/gl/wscript")
           if w_path.exists():
               w = w_path.read_text()
@@ -175,7 +168,6 @@ jobs:
                   w_path.write_text(w)
                   print("Wscript patched safely (monkeypatch).")
 
-          # 5. БЕЗОПАСНЫЙ ПАТЧ IN_MOVE (Как советовал Клод)
           in_path = Path("client/cl_dll/input/input_xash3d.cpp")
           if in_path.exists():
               in_txt = in_path.read_text()
@@ -211,7 +203,6 @@ jobs:
                   in_path.write_text(in_txt)
                   print("IN_Move patched correctly.")
 
-          # 6. Отключаем MenuFactory
           patch_file("client/cl_dll/cdll_int.cpp", 'static void LoadMenuInterface( void )\n{\n\tif( g_pMenu )\n\t\treturn;\n\n\tg_pMenu = GetNativeMenuExports();\n\tif( !g_pMenu )\n\t\tHUD_MessageBox( "Error: native object \\"MenuFactory\\" is unavailable\\n" );\n}', 'static void LoadMenuInterface( void )\n{\n\tg_pMenu = nullptr;\n}')
           PYEOF
 
@@ -219,16 +210,21 @@ jobs:
         run: |
           set -euo pipefail
           cd engine
+
           sed -i 's/ANDROID_NDK_VERSION=.*/ANDROID_NDK_VERSION="28.2.13676358"/' scripts/gha/deps_android.sh
           sed -i 's/ndkVersion = .*/ndkVersion = "28.2.13676358"/' android/app/build.gradle.kts
           sed -i 's/setOf("armeabi-v7a", "arm64-v8a", "x86")/setOf("arm64-v8a")/' android/app/build.gradle.kts
-          
+
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/deps_android.sh
-          
+
+          # ДИАГНОСТИКА WAF
+          echo "=== DIAGNOSTICS: waf configure verbose ==="
+          python3 waf configure -v --disable-werror --enable-lto=no 2>&1 || true
+          echo "=== END DIAGNOSTICS ==="
+
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
-          # Запускаем сборку. Waf теперь должен сгенерировать build.ninja без ошибок.
           GITHUB_WORKSPACE="$PWD" bash scripts/gha/build_android.sh
-          
+
           cd ../client/android
           chmod +x gradlew
           printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
