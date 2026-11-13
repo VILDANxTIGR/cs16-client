@@ -18,7 +18,7 @@ workflows:
           git submodule update --init --recursive
           
           # ВАЖНО: Принудительно инициализируем nanogl и gl4es, 
-          # так как Waf падает без них (ошибка "Can't find 3rdparty/nanogl submodule")
+          # так как Waf падает без них
           git submodule update --init --checkout 3rdparty/nanogl
           git submodule update --init --checkout 3rdparty/gl4es/gl4es || true
           
@@ -324,6 +324,9 @@ workflows:
 
           cd engine
           
+          # ФИКС SDL2: Устанавливаем переменную, которую ожидает скрипт Waf
+          export BUILD_CMAKE_LIBRARY_OUTPUT_DIRECTORY="$PWD/build-android-arm64/lib"
+
           # Ручной запуск waf configure для диагностики
           WAFLOCK=.lock-waf_android_arm64-v8a_manual python3 ./waf configure \
             -t . -o build-android-arm64 -T debug \
