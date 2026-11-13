@@ -47,7 +47,7 @@ workflows:
           # 2. SDL
           curl -fsSL --retry 3 --retry-delay 2 -o /tmp/sdl2.tar.gz "https://github.com/libsdl-org/SDL/archive/refs/tags/release-2.30.0.tar.gz"
           mkdir -p 3rdparty/SDL && tar -xzf /tmp/sdl2.tar.gz --strip-components=1 -C 3rdparty/SDL
-          # 3. FFmpeg
+          # 3. FFmpeg (скачиваем, но в waf configure его отключим)
           curl -fsSL --retry 3 --retry-delay 2 -o /tmp/ffmpeg.tar.gz "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/refs/tags/n6.0"
           mkdir -p 3rdparty/ffmpeg && tar -xzf /tmp/ffmpeg.tar.gz --strip-components=1 -C 3rdparty/ffmpeg
 
@@ -324,15 +324,14 @@ workflows:
 
           cd engine
           
-          # ФИКС SDL2: Устанавливаем переменную, которую ожидает скрипт Waf
+          # Устанавливаем переменную для SDL2
           export BUILD_CMAKE_LIBRARY_OUTPUT_DIRECTORY="$PWD/build-android-arm64/lib"
 
-          # Ручной запуск waf configure для диагностики
+          # Ручной запуск waf configure (ФЛАГИ FFMPEG ЗАКОММЕНТИРОВАНЫ)
           WAFLOCK=.lock-waf_android_arm64-v8a_manual python3 ./waf configure \
             -t . -o build-android-arm64 -T debug \
             --android=arm64-v8a,,21 \
             -s 3rdparty/SDL --skip-sdl2-sanity-check --enable-bundled-deps \
-            --enable-ffmpeg --enable-ffmpeg-dlopen --ffmpeg-dir=3rdparty/ffmpeg \
             ninja || { echo '===== config.log ====='; tail -n 300 build-android-arm64/config.log; exit 1; }
           
           # Запуск сборки через Gradle (движок)
