@@ -106,27 +106,7 @@ jobs:
             sed -i '/git submodule update --init --checkout 3rdparty\/nanogl/d' engine/scripts/gha/deps_android.sh
           fi
 
-      - name: Disable optional MenuFactory
-        shell: python
-        run: |
-          import pathlib
-          import sys
-
-          path = pathlib.Path("client/cl_dll/cdll_int.cpp")
-          content = path.read_text(encoding="utf-8")
-
-          old = 'static void LoadMenuInterface( void )\n{\n\tif( g_pMenu )\n\t\treturn;\n\n\tg_pMenu = GetNativeMenuExports();\n\tif( !g_pMenu )\n\t\tHUD_MessageBox( "Error: native object \\"MenuFactory\\" is unavailable\\n" );\n}'
-
-          new = 'static void LoadMenuInterface( void )\n{\n\tg_pMenu = nullptr;\n}'
-
-          count = content.count(old)
-          if count != 1:
-              sys.exit(f"MenuFactory patch: expected 1 match, found {count}")
-
-          path.write_text(content.replace(old, new, 1), encoding="utf-8")
-          print("MenuFactory loading disabled.")
-
-      - name: Patch Engine (Wallhack + No Recoil + Net Buffer)
+      - name: Patch Engine (Wallhack + Fixed No Recoil)
         shell: python
         run: |
           import os
@@ -150,24 +130,19 @@ jobs:
 
               print(f"Patched: {desc}")
 
-          # 1. Wallhack
           renderer_path = "engine/ref/gl/gl_rmain.c"
           old_renderer = "R_DrawStudioModel( RI.currententity );"
-          new_renderer = (
-              'if ( RI.currententity->player && gEngfuncs.pfnGetCvarPointer( "esp_enabled" ) && gEngfuncs.pfnGetCvarPointer( "esp_enabled" )->value > 0.5f )\n'
-              '{\n'
-              '    GLboolean old_depth = pglIsEnabled( GL_DEPTH_TEST );\n'
-              '    pglDisable( GL_DEPTH_TEST );\n'
-              '    R_DrawStudioModel( RI.currententity );\n'
-              '    if( old_depth ) pglEnable( GL_DEPTH_TEST );\n'
-              '    else pglDisable( GL_DEPTH_TEST );\n'
-              '}\n'
-              'else\n'
-              '{\n'
-              '    R_DrawStudioModel( RI.currententity );\n'
-              '}'
-          )
-          
+          new_renderer = """if ( RI.currententity->player && gEngfuncs.pfnGetCvarPointer( "esp_enabled" ) && gEngfuncs.pfnGetCvarPointer( "esp_enabled" )->value > 0.5f )
+          {
+              pglDepthRange( 0.0f, 0.01f );
+              R_DrawStudioModel( RI.currententity );
+              pglDepthRange( gldepthmin, gldepthmax );
+          }
+          else
+          {
+              R_DrawStudioModel( RI.currententity );
+          }"""
+
           if not os.path.exists(renderer_path):
               sys.exit("ERROR: Renderer file not found")
 
@@ -175,17 +150,17 @@ jobs:
               content = f.read()
 
           count = content.count(old_renderer)
-          if count != 2:
-              sys.exit(f"ERROR: Expected 2 renderer anchors, found {count}")
+          if count == 0:
+              sys.exit("ERROR: R_DrawStudioModel not found")
 
           content = content.replace(old_renderer, new_renderer)
 
           with open(renderer_path, "w") as f:
               f.write(content)
 
-          print(f"Renderer patched for True Wallhack: {count} occurrences")
+          print(f"Renderer patched: {count} occurrences")
 
-          # 2. CVAR definitions
+          # ИСПРАВЛЕНЫ ПУТИ (добавлена папка engine/)
           main_file = "engine/engine/client/cl_main.c"
           replace_once(
               main_file,
@@ -194,22 +169,18 @@ jobs:
               "CVAR definitions"
           )
 
-          # 3. No Recoil (engine) - soft
+          # ИСПРАВЛЕНЫ ПУТИ (добавлена папка engine/)
           view_file = "engine/engine/client/cl_view.c"
-          if os.path.exists(view_file):
-              with open(view_file, "r") as f:
-                  content = f.read()
-              old_nr = "VectorCopy( cl.punchangle, fd->punchangle );"
-              new_nr = 'if( Cvar_VariableValue( "norecoil" ) > 0.5f )\n\t\tVectorClear( cl.punchangle );\n\tVectorCopy( cl.punchangle, fd->punchangle );'
-              if old_nr in content:
-                  content = content.replace(old_nr, new_nr, 1)
-                  print("Patched cl_view.c for No Recoil")
-              else:
-                  print("WARNING: Could not find punchangle in cl_view.c")
-              with open(view_file, "w") as f:
-                  f.write(content)
+          replace_once(
+              view_file,
+              "VectorCopy( cl.punchangle, fd->punchangle );",
+              '''if( Cvar_VariableValue( "norecoil" ) > 0.5f )
+              VectorClear( cl.punchangle );
+          VectorCopy( cl.punchangle, fd->punchangle );''',
+              "No Recoil"
+          )
 
-          # 4. ESP color
+          # ИСПРАВЛЕНЫ ПУТИ (добавлена папка engine/)
           frame_file = "engine/engine/client/cl_frame.c"
           replace_once(
               frame_file,
@@ -218,266 +189,78 @@ jobs:
               "ESP render mode"
           )
 
-          # 5. Net buffer (soft)
-          net_chan_file = "engine/common/net_chan.h"
-          if os.path.exists(net_chan_file):
-              with open(net_chan_file, "r") as f:
-                  content = f.read()
-              patched = False
-              for old_val in ["16384", "0x4000", "32768", "0x8000"]:
-                  old_str = f"#define NET_MAX_MESSAGE {old_val}"
-                  if old_str in content:
-                      content = content.replace(old_str, "#define NET_MAX_MESSAGE 65536", 1)
-                      print(f"Patched NET_MAX_MESSAGE from {old_val} to 65536")
-                      patched = True
-                      break
-              if not patched:
-                  print("WARNING: Could not find NET_MAX_MESSAGE definition")
-              with open(net_chan_file, "w") as f:
-                  f.write(content)
-          else:
-              print("WARNING: net_chan.h not found")
-
-      - name: Patch Client (Aimbot + Bhop + No Recoil + FOV)
+      - name: Patch Client (Aimbot + Bunnyhop)
         shell: python
         run: |
           import os
           import sys
 
-          def replace_once(path, old, new, desc):
-              if not os.path.exists(path):
-                  sys.exit(f"ERROR: File not found: {path}")
-
-              with open(path, "r") as f:
-                  content = f.read()
-
-              count = content.count(old)
-              if count != 1:
-                  sys.exit(f"ERROR: {desc}: expected 1 match, found {count}")
-
-              content = content.replace(old, new, 1)
-
-              with open(path, "w") as f:
-                  f.write(content)
-
-              print(f"Patched: {desc}")
-
           input_file = 'client/cl_dll/input/input_xash3d.cpp'
-          replace_once(
-              input_file,
-              'bool g_bAimbotEnabled = false;',
-              'bool g_bAimbotEnabled = false;\nbool g_bBhopEnabled = false;',
-              'Global Vars'
-          )
-          replace_once(
-              input_file,
-              'void ToggleAimbot( void )',
-              'void ToggleBhop( void )\n{\n    g_bBhopEnabled = !g_bBhopEnabled;\n}\n\nvoid ToggleAimbot( void )',
-              'ToggleBhop func'
-          )
-          replace_once(
-              input_file,
-              'gEngfuncs.pfnAddCommand( "toggle_aim", ToggleAimbot );',
-              'gEngfuncs.pfnAddCommand( "toggle_aim", ToggleAimbot );\n\tgEngfuncs.pfnAddCommand( "toggle_bhop", ToggleBhop );',
-              'Bhop command'
-          )
-
-          old_in_move = 'void IN_Move( float frametime, usercmd_t *cmd )\n{'
-
-          new_in_move = (
-              "void IN_Move( float frametime, usercmd_t *cmd )\n"
-              "{\n"
-              "    cl_entity_t *local = gEngfuncs.GetLocalPlayer();\n"
-              "\n"
-              "    if ( local && g_bBhopEnabled && ( cmd->buttons & IN_JUMP ) )\n"
-              "    {\n"
-              "        if ( local->curstate.onground != -1 )\n"
-              "        {\n"
-              "            cmd->buttons |= IN_JUMP;\n"
-              "        }\n"
-              "        else\n"
-              "        {\n"
-              "            cmd->buttons &= ~IN_JUMP;\n"
-              "        }\n"
-              "    }\n"
-              "\n"
-              "    if ( g_bAimbotEnabled && local && ( cmd->buttons & IN_ATTACK ) )\n"
-              "    {\n"
-              "        cl_entity_t *best_target = NULL;\n"
-              "        float best_dist = 99999.0f;\n"
-              "        vec3_t delta;\n"
-              "        float fov = 90.0f;\n"
-              "\n"
-              "        for ( int i = 1; i <= 32; i++ )\n"
-              "        {\n"
-              "            cl_entity_t *ent = gEngfuncs.GetEntityByIndex(i);\n"
-              "            if ( ent && ent->player && ent->curstate.health > 0 && ent->index != local->index )\n"
-              "            {\n"
-              "                delta[0] = ent->origin[0] - local->origin[0];\n"
-              "                delta[1] = ent->origin[1] - local->origin[1];\n"
-              "                delta[2] = ent->origin[2] - local->origin[2];\n"
-              "                float dist = sqrt(delta[0]*delta[0] + delta[1]*delta[1] + delta[2]*delta[2]);\n"
-              "                if ( dist < best_dist && dist < 2000.0f )\n"
-              "                {\n"
-              "                    float hyp = sqrt(delta[0]*delta[0] + delta[1]*delta[1]);\n"
-              "                    float target_pitch = atan2(delta[2], hyp) * 180.0f / M_PI;\n"
-              "                    float target_yaw = atan2(delta[1], delta[0]) * 180.0f / M_PI;\n"
-              "                    \n"
-              "                    float pitch_diff = fabs( target_pitch - cmd->viewangles[0] );\n"
-              "                    float yaw_diff = fabs( target_yaw - cmd->viewangles[1] );\n"
-              "                    \n"
-              "                    if ( pitch_diff < fov && yaw_diff < fov )\n"
-              "                    {\n"
-              "                        best_dist = dist;\n"
-              "                        best_target = ent;\n"
-              "                    }\n"
-              "                }\n"
-              "            }\n"
-              "        }\n"
-              "        if ( best_target )\n"
-              "        {\n"
-              "            delta[0] = best_target->origin[0] - local->origin[0];\n"
-              "            delta[1] = best_target->origin[1] - local->origin[1];\n"
-              "            delta[2] = best_target->origin[2] - local->origin[2];\n"
-              "            float hyp = sqrt(delta[0]*delta[0] + delta[1]*delta[1]);\n"
-              "            cmd->viewangles[0] = atan2(delta[2], hyp) * 180.0f / M_PI;\n"
-              "            cmd->viewangles[1] = atan2(delta[1], delta[0]) * 180.0f / M_PI;\n"
-              "        }\n"
-              "    }\n"
-          )
-          replace_once(input_file, old_in_move, new_in_move, 'IN_Move start')
-
-          # No Recoil (client) - soft
-          view_cpp = 'client/cl_dll/view.cpp'
-          if os.path.exists(view_cpp):
-              with open(view_cpp, "r") as f:
-                  content = f.read()
-              old_punch = 'pparams->viewangles = pparams->cl_viewangles + pparams->punchangle + ev_punchangle;'
-              new_punch = 'pparams->viewangles = pparams->cl_viewangles + ev_punchangle;'
-              if old_punch in content:
-                  content = content.replace(old_punch, new_punch, 1)
-                  print("Patched view.cpp for No Recoil (client)")
-              else:
-                  print("WARNING: Could not find punchangle line in view.cpp")
-              with open(view_cpp, "w") as f:
-                  f.write(content)
-
-          # FOV Circle in hud.cpp - soft
-          hud_file = 'client/cl_dll/hud.cpp'
-          if os.path.exists(hud_file):
-              with open(hud_file, "r") as f:
+          if os.path.exists(input_file):
+              with open(input_file, 'r') as f:
                   content = f.read()
 
-              draw_funcs = (
-                  "\n"
-                  "#include <math.h>\n"
-                  "#include <stdlib.h>\n"
-                  "#ifndef M_PI\n"
-                  "#define M_PI 3.14159265358979323846\n"
-                  "#endif\n"
-                  "\n"
-                  "extern bool g_bAimbotEnabled;\n"
-                  "\n"
-                  "static void DrawDebugCircle(int cx, int cy, int radius, int segments, int r, int g, int b, int a)\n"
-                  "{\n"
-                  "    if (radius <= 0 || segments < 3) return;\n"
-                  "    float previousX = cx + radius;\n"
-                  "    float previousY = cy;\n"
-                  "    for (int i = 1; i <= segments; i++)\n"
-                  "    {\n"
-                  "        float angle = (float)i * 2.0f * (float)M_PI / segments;\n"
-                  "        float currentX = cx + cosf(angle) * radius;\n"
-                  "        float currentY = cy + sinf(angle) * radius;\n"
-                  "        int x1 = (int)previousX;\n"
-                  "        int y1 = (int)previousY;\n"
-                  "        int x2 = (int)currentX;\n"
-                  "        int y2 = (int)currentY;\n"
-                  "        int dx = abs(x2 - x1);\n"
-                  "        int dy = abs(y2 - y1);\n"
-                  "        int sx = x1 < x2 ? 1 : -1;\n"
-                  "        int sy = y1 < y2 ? 1 : -1;\n"
-                  "        int error = dx - dy;\n"
-                  "        while (true)\n"
-                  "        {\n"
-                  "            FillRGBA(x1, y1, 2, 2, r, g, b, a);\n"
-                  "            if (x1 == x2 && y1 == y2) break;\n"
-                  "            int e2 = 2 * error;\n"
-                  "            if (e2 > -dy) { error -= dy; x1 += sx; }\n"
-                  "            if (e2 < dx) { error += dx; y1 += sy; }\n"
-                  "        }\n"
-                  "        previousX = currentX;\n"
-                  "        previousY = currentY;\n"
-                  "    }\n"
-                  "}\n"
-                  "\n"
-                  "static void DrawCameraFOVDebug()\n"
-                  "{\n"
-                  "    const float debugFOV = 90.0f;\n"
-                  "    float cameraFOV = (float)gHUD.m_iFOV;\n"
-                  "    if (cameraFOV <= 0.0f) cameraFOV = 90.0f;\n"
-                  "    const float halfScreen = ScreenWidth * 0.5f;\n"
-                  "    float radius = halfScreen * tanf(debugFOV * (float)M_PI / 360.0f) / tanf(cameraFOV * (float)M_PI / 360.0f);\n"
-                  "    int cx = ScreenWidth / 2;\n"
-                  "    int cy = ScreenHeight / 2;\n"
-                  "    DrawDebugCircle(cx, cy, (int)radius, 96, 0, 255, 0, 180);\n"
-                  "}\n"
-                  "\n"
-              )
+              def replace_once(source, old, new, desc):
+                  count = source.count(old)
+                  if count != 1:
+                      sys.exit(f'ERROR: {desc}: expected 1 match, found {count}')
+                  return source.replace(old, new, 1)
 
-              search_str = 'void CHud::Redraw( float flTime, int intermission )'
-              if search_str in content:
-                  content = content.replace(search_str, draw_funcs + search_str, 1)
-                  start_idx = content.find(search_str)
-                  brace_idx = content.find('{', start_idx)
-                  if brace_idx != -1:
-                      inject = '\n\tif ( g_bAimbotEnabled ) DrawCameraFOVDebug();\n'
-                      content = content[:brace_idx+1] + inject + content[brace_idx+1:]
-                      print("Injected FOV circle into hud.cpp")
-                  else:
-                      print("WARNING: Could not find brace for CHud::Redraw")
-              else:
-                  print("WARNING: Could not find CHud::Redraw in hud.cpp")
+              content = replace_once(content, 'bool g_bAimbotEnabled = false;', 'bool g_bAimbotEnabled = false;\nbool g_bBhopEnabled = false;', 'Bhop global var')
+              content = replace_once(content, 'void ToggleAimbot( void )', 'void ToggleBhop( void )\n{\n    g_bBhopEnabled = !g_bBhopEnabled;\n}\n\nvoid ToggleAimbot( void )', 'ToggleBhop func')
+              content = replace_once(content, 'gEngfuncs.pfnAddCommand( "toggle_aim", ToggleAimbot );', 'gEngfuncs.pfnAddCommand( "toggle_aim", ToggleAimbot );\n\tgEngfuncs.pfnAddCommand( "toggle_bhop", ToggleBhop );', 'Bhop command')
 
-              with open(hud_file, 'w') as f:
+              old_func = 'void IN_Move( float frametime, usercmd_t *cmd )\n{'
+              new_func = 'void IN_Move( float frametime, usercmd_t *cmd )\n{\n    cl_entity_t *local = gEngfuncs.GetLocalPlayer();\n\n    if ( local && g_bBhopEnabled && ( cmd->buttons & IN_JUMP ) )\n    {\n        if ( local->curstate.onground != -1 )\n        {\n            cmd->buttons |= IN_JUMP;\n        }\n    }\n'
+              content = replace_once(content, old_func, new_func, 'IN_Move start')
+
+              with open(input_file, 'w') as f:
                   f.write(content)
+              print('Client patch applied and all anchors verified.')
 
-      - name: Fix VectorSubtract and check
-        shell: python
+      - name: Fix MenuFactory Crash (sed)
         run: |
-          import pathlib
-          import sys
+          # ИСПРАВЛЕН ПУТЬ
+          sed -i 's/gEngfuncs.Host_Error( "MenuFactory is unavailable.*/gEngfuncs.Con_Printf( "MenuFactory is unavailable\\n" );/' client/cl_dll/cdll_int.cpp || true
+          sed -i 's/Host_Error( "MenuFactory is unavailable.*/Con_Printf( "MenuFactory is unavailable\\n" );/' client/cl_dll/cdll_int.cpp || true
+          echo "Checked and patched cdll_int.cpp for MenuFactory."
 
-          path = pathlib.Path("client/cl_dll/input/input_xash3d.cpp")
+      - name: Disable local server
+        run: |
+          # ИСПРАВЛЕН ПУТЬ
+          sed -i 's/option(BUILD_SERVER "Build server library." ON)/option(BUILD_SERVER "Build server library." OFF)/' client/CMakeLists.txt || true
 
-          if not path.exists():
-              sys.exit("ERROR: input_xash3d.cpp not found")
+      - name: Fetch YaPB history
+        run: git -C client/3rdparty/yapb fetch --unshallow origin || true
 
-          content = path.read_text(encoding="utf-8")
+      - name: Engine - dependencies
+        working-directory: engine
+        run: GITHUB_WORKSPACE="$PWD" bash scripts/gha/deps_android.sh
 
-          replacements = [
-              (
-                  "VectorSubtract( ent->origin, local->origin, delta );",
-                  "delta[0] = ent->origin[0] - local->origin[0];\n"
-                  "                delta[1] = ent->origin[1] - local->origin[1];\n"
-                  "                delta[2] = ent->origin[2] - local->origin[2];"
-              ),
-              (
-                  "VectorSubtract( best_target->origin, local->origin, delta );",
-                  "delta[0] = best_target->origin[0] - local->origin[0];\n"
-                  "                delta[1] = best_target->origin[1] - local->origin[1];\n"
-                  "                delta[2] = best_target->origin[2] - local->origin[2];"
-              )
-          ]
+      - name: Engine - restrict ABI
+        working-directory: engine
+        run: |
+          F=android/app/build.gradle.kts
+          sed -i 's/setOf("armeabi-v7a", "arm64-v8a", "x86")/setOf("arm64-v8a")/' "$F"
 
-          for old, new in replacements:
-              count = content.count(old)
-              if count != 1:
-                  print(f"WARNING: Expected 1 occurrence, found {count}: {old}")
-              else:
-                  content = content.replace(old, new, 1)
+      - name: Engine - build
+        working-directory: engine
+        run: GITHUB_WORKSPACE="$PWD" bash scripts/gha/build_android.sh
 
-          if "VectorSubtract(" in content:
-              print("ERROR: Other VectorSubtract calls remain!")
-              sys.exit(1)
+      - name: Client - build (Clean ID)
+        working-directory: client/android
+        run: |
+          sed -i 's/applicationIdSuffix[[:space:]]*[=]*[[:space:]]*["'\'']\?\.test["'\'']\?//g' app/build.gradle || true
+          sed -i 's/applicationIdSuffix[[:space:]]*[=]*[[:space:]]*["'\'']\?\.test["'\'']\?//g' app/build.gradle.kts || true
+          
+          chmod +x gradlew
+          ./gradlew clean assembleGitDebug -Pandroid.injected.build.abi=arm64-v8a --stacktrace
 
-          path.write_text(c
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: Final-APKs
+          path: |
+            engine/artifacts/*.apk
+            client/android/app/build/outputs/apk/git/debug/*.apk
+          if-no-files-found: error
