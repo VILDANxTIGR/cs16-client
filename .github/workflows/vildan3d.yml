@@ -1,297 +1,483 @@
-name: VILDAN 3D Final
-on: [workflow_dispatch, push]
+name: Build Xash3D FWGS (arm64-v8a) + CS16Client (Android)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
 env:
+  CLIENT_REPO: ${{ github.repository }}
+  CLIENT_REF: ${{ github.ref_name }}
+  
   ENGINE_REPO: VILDANxTIGR/xash3d-fwgs
-  CLIENT_REPO: VILDANxTIGR/cs16-client
-  NDK_VERSION: '28.2.13676358'
-  FFMPEG_TAG: 'n6.0'
-  IMGUI_TAG: 'v1.90.5'
-  SDL_TAG: 'release-2.30.0'
+  ENGINE_REF: master
+
+  SDL_VERSION: 2.32.10
+  FFMPEG_VERSION: '9.0'
+  GH_CPU_OS: android
+  GH_CPU_ARCH: multiarch
+
+  NDK_28: 28.2.13676358
+  NDK_29: 29.0.14206865
+  CMAKE_VERSION: 3.22.1
+
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    name: Build engine + client
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
     steps:
-      - uses: actions/checkout@v4
-        with: { repository: '${{ env.ENGINE_REPO }}', ref: 707596f4905689ec224e993fcaa4d4ad66aa67d6, path: engine }
-      - uses: actions/checkout@v4
-        with: { repository: '${{ env.CLIENT_REPO }}', path: client }
-      - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: '21' }
+      - name: Checkout engine
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ENGINE_REPO }}
+          ref: ${{ env.ENGINE_REF }}
+          path: engine
+          submodules: false
 
-      - name: Deps / NDK
+      - name: Checkout client
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CLIENT_REPO }}
+          ref: ${{ env.CLIENT_REF }}
+          path: client
+          submodules: false
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install CMake, Ninja and ccache
         run: |
-          set -euo pipefail
-          sudo apt-get update -qq && sudo apt-get install -y -qq cmake ninja-build unzip curl xz-utils python3 git
-          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
-          "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${NDK_VERSION}" >/dev/null
-          NDK="$SDK/ndk/${NDK_VERSION}"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build ccache
 
-      - name: Setup Dependencies & Copy to Engine
+      - name: Install Android SDK components
         run: |
-          set -euo pipefail
-          cd engine
-          mkdir -p 3rdparty
-          rm -rf 3rdparty/imgui 3rdparty/SDL 3rdparty/ffmpeg 3rdparty/mainui
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "cmake;${CMAKE_VERSION}" \
+            "ndk;${NDK_28}" \
+            "ndk;${NDK_29}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_28}" >> "$GITHUB_ENV"
 
-          # 1. ImGui
-          git clone --depth 1 --branch "${IMGUI_TAG}" https://github.com/ocornut/imgui.git 3rdparty/imgui
-          
-          # 2. SDL
-          curl -fsSL --retry 3 --retry-delay 2 -o /tmp/sdl2.tar.gz "https://github.com/libsdl-org/SDL/archive/refs/tags/${SDL_TAG}.tar.gz"
-          mkdir -p 3rdparty/SDL && tar -xzf /tmp/sdl2.tar.gz --strip-components=1 -C 3rdparty/SDL
-          
-          # 3. FFmpeg
-          curl -fsSL --retry 3 --retry-delay 2 -o /tmp/ffmpeg.tar.gz "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/refs/tags/${FFMPEG_TAG}"
-          mkdir -p 3rdparty/ffmpeg && tar -xzf /tmp/ffmpeg.tar.gz --strip-components=1 -C 3rdparty/ffmpeg
-          
-          # 4. MainUI (Клонируем вручную, чтобы не было CMake Error)
-          git clone --depth 1 https://github.com/FWGS/hlsdk-portable.git 3rdparty/mainui
-          
-          # Копируем ImGui ВНУТРЬ дерева ref/gl/imgui
-          mkdir -p ref/gl/imgui/backends
-          cp 3rdparty/imgui/imgui.cpp 3rdparty/imgui/imgui.h 3rdparty/imgui/imgui_internal.h 3rdparty/imgui/imconfig.h ref/gl/imgui/
-          cp 3rdparty/imgui/imgui_draw.cpp 3rdparty/imgui/imgui_tables.cpp 3rdparty/imgui/imgui_widgets.cpp ref/gl/imgui/
-          cp 3rdparty/imgui/imstb_rectpack.h 3rdparty/imgui/imstb_textedit.h 3rdparty/imgui/imstb_truetype.h ref/gl/imgui/
-          cp 3rdparty/imgui/backends/imgui_impl_opengl3.cpp 3rdparty/imgui/backends/imgui_impl_opengl3.h ref/gl/imgui/backends/
-          cp 3rdparty/imgui/backends/imgui_impl_opengl3_loader.h ref/gl/imgui/backends/
-
-      - name: Generate UI Code & Patch
+      - name: Init submodules
         shell: bash
         run: |
-          python3 << 'PYEOF'
-          import os, re
-          from pathlib import Path
-
-          # 1. Отключаем скачивание в deps_android.sh
-          deps = Path("engine/scripts/gha/deps_android.sh")
-          if deps.exists():
-              out = []
-              for line in deps.read_text().splitlines():
-                  if re.search(r'(wget|curl|git clone)', line) and re.search(r'(SDL|ffmpeg|FFmpeg|mainui|hlsdk)', line, re.IGNORECASE):
-                      out.append(": # [PATCHED] Skipped download: " + line.strip())
-                  else:
-                      out.append(line)
-              deps.write_text("\n".join(out))
-              os.system("bash -n engine/scripts/gha/deps_android.sh")
-
-          # 2. Генерация vildan_menu.h и .cpp
-          header = '#pragma once\n#ifdef __cplusplus\nextern "C" {\n#endif\nvoid VILDAN_Init(void);\nvoid VILDAN_DrawMenu(void);\nvoid VILDAN_ProcessTouch(int, float, float, long long);\n#ifdef __cplusplus\n}\n#endif'
-          Path("engine/ref/gl/vildan_menu.h").write_text(header)
-          
-          cpp = r'''#include "vildan_menu.h"
-          #include "imgui/imgui.h"
-          #include "imgui/backends/imgui_impl_opengl3.h"
-          #include <GLES2/gl2.h>
-          #include "ref_api.h"
-          #include <SDL.h>
-          static bool r = false, o = true;
-          extern "C" void VILDAN_ProcessTouch(int a, float x, float y, long long f) {
-              if(!r) return; auto& i = ImGui::GetIO();
-              if(i.DisplaySize.x <= 0 || i.DisplaySize.y <= 0) return;
-              float rx = x * i.DisplaySize.x, ry = y * i.DisplaySize.y;
-              if(a == 1) { i.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen); i.AddMousePosEvent(rx, ry); i.AddMouseButtonEvent(0, true); }
-              else if(a == 2) { i.AddMousePosEvent(rx, ry); }
-              else if(a == 3) { i.AddMousePosEvent(rx, ry); i.AddMouseButtonEvent(0, false); }
-          }
-          int VILDAN_EventWatch(void *u, SDL_Event *e) {
-              if(e->type == SDL_FINGERDOWN || e->type == SDL_FINGERMOTION || e->type == SDL_FINGERUP) {
-                  int a = e->type == SDL_FINGERDOWN ? 1 : (e->type == SDL_FINGERMOTION ? 2 : 3);
-                  VILDAN_ProcessTouch(a, e->tfinger.x, e->tfinger.y, e->tfinger.fingerId);
-              }
-              return 0;
-          }
-          extern "C" void VILDAN_Init(void) {
-              if(r) return; IMGUI_CHECKVERSION(); ImGui::CreateContext(); ImGui::StyleColorsDark();
-              ImGui::GetIO().IniFilename = nullptr; ImGui::GetIO().Fonts->AddFontDefault();
-              ImGui::GetStyle().ScaleAllSizes(1.7f);
-              if(!ImGui_ImplOpenGL3_Init("#version 100")) return;
-              SDL_AddEventWatch(VILDAN_EventWatch, NULL); r = true;
-          }
-          extern "C" void VILDAN_DrawMenu(void) {
-              if(!r) return; GLint v[4]; glGetIntegerv(GL_VIEWPORT, v);
-              if(v[2] <= 0 || v[3] <= 0) return; auto& i = ImGui::GetIO();
-              i.DisplaySize = ImVec2(v[2], v[3]); i.DeltaTime = 1.0f/60.0f;
-              ImGui_ImplOpenGL3_NewFrame(); ImGui::NewFrame();
-              if(o) {
-                  ImGui::SetNextWindowSize(ImVec2(800, 560), ImGuiCond_FirstUseEver);
-                  ImGui::SetNextWindowPos(ImVec2(40, 40), ImGuiCond_FirstUseEver);
-                  if(ImGui::Begin("VILDAN 3D - Mod Menu", &o)) {
-                      ImGui::Text("Welcome!"); ImGui::Separator();
-                      auto* c1 = gEngfuncs.pfnGetCvarPointer("vildan_esp"); bool b1 = c1 && c1->value > 0.5f;
-                      if(ImGui::Checkbox("ESP", &b1)) { if(c1) c1->value = b1 ? 1.0f : 0.0f; }
-                      auto* c2 = gEngfuncs.pfnGetCvarPointer("vildan_aimbot"); bool b2 = c2 && c2->value > 0.5f;
-                      if(ImGui::Checkbox("Aimbot", &b2)) { if(c2) c2->value = b2 ? 1.0f : 0.0f; }
-                      auto* c3 = gEngfuncs.pfnGetCvarPointer("vildan_bhop"); bool b3 = c3 && c3->value > 0.5f;
-                      if(ImGui::Checkbox("Bhop", &b3)) { if(c3) c3->value = b3 ? 1.0f : 0.0f; }
-                      if(ImGui::Button("Свернуть")) o = false;
-                  } ImGui::End();
-              }
-              if(!o) {
-                  ImGui::SetNextWindowPos(ImVec2(i.DisplaySize.x - 80, 10), ImGuiCond_Always);
-                  ImGui::SetNextWindowSize(ImVec2(70, 70), ImGuiCond_Always);
-                  if(ImGui::Begin("##V", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar)) {
-                      if(ImGui::Button("V", ImVec2(60, 60))) o = true;
-                  } ImGui::End();
-              }
-              ImGui::Render(); ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-          }'''
-          Path("engine/ref/gl/vildan_menu.cpp").write_text(cpp)
-
-          def patch_file(path, old, new):
-              p = Path(path)
-              if p.exists():
-                  txt = p.read_text()
-                  if old in txt:
-                      p.write_text(txt.replace(old, new, 1))
-
-          # 3. Патчи C-файлов
-          patch_file("engine/ref/gl/gl_opengl.c", "#include \"../ref_api.h\"", "#include \"../ref_api.h\"\n#include \"vildan_menu.h\"")
-          patch_file("engine/ref/gl/gl_rmain.c", "#include \"../ref_api.h\"", "#include \"../ref_api.h\"\n#include \"vildan_menu.h\"")
-          patch_file("engine/ref/gl/gl_opengl.c", "GL_OnContextCreated();", "GL_OnContextCreated();\n\tVILDAN_Init();")
-          patch_file("engine/ref/gl/gl_rmain.c", "R_DrawStudioModel( RI.currententity );", 'if(RI.currententity->player && gEngfuncs.pfnGetCvarPointer("vildan_esp") && gEngfuncs.pfnGetCvarPointer("vildan_esp")->value > 0.5f) { GLboolean od = pglIsEnabled(GL_DEPTH_TEST); pglDisable(GL_DEPTH_TEST); R_DrawStudioModel(RI.currententity); if(od) pglEnable(GL_DEPTH_TEST); } else R_DrawStudioModel(RI.currententity);')
-          patch_file("engine/ref/gl/gl_rmain.c", "gEngfuncs.GL_SwapBuffers();", "VILDAN_DrawMenu();\n\tgEngfuncs.GL_SwapBuffers();")
-
-          # 4. ПАТЧ WSCRIPT (Точный байтовый патч от GPT-4 Sol)
-          w_path = Path("engine/ref/gl/wscript")
-          if w_path.exists():
-              w_bytes = w_path.read_bytes()
-              def line(level, text):
-                  return ('\t' * level + text + '\n').encode('utf-8')
-              old = b''.join([
-                  line(2, 'bld.shlib(source = source,'),
-                  line(3, 'target = k,'),
-                  line(3, 'includes = includes,'),
-                  line(3, "features = 'format',"),
-                  line(3, "use = libs + v['libs'],"),
-                  line(3, "defines = v['defines'] + ['REF_DLL=1'],"),
-                  line(3, 'install_path = bld.env.LIBDIR)'),
-              ])
-              replacement = [
-                  (2, 'menu_source = source'),
-                  (2, 'menu_includes = includes'),
-                  (2, "menu_defines = v['defines'] + ['REF_DLL=1']"),
-                  (2, 'menu_lib = []'),
-                  (2, "menu_features = 'format'"),
-                  (0, ''),
-                  (2, "if bld.env.DEST_OS == 'android' and k in ('ref_gles3compat', 'ref_gl4es'):"),
-                  (3, 'extra_files = ['),
-                  (4, "'imgui/imgui.cpp',"),
-                  (4, "'imgui/imgui_draw.cpp',"),
-                  (4, "'imgui/imgui_tables.cpp',"),
-                  (4, "'imgui/imgui_widgets.cpp',"),
-                  (4, "'imgui/backends/imgui_impl_opengl3.cpp',"),
-                  (4, "'vildan_menu.cpp',"),
-                  (3, ']'),
-                  (3, 'extra_nodes = []'),
-                  (3, 'for filename in extra_files:'),
-                  (4, 'node = bld.path.find_node(filename)'),
-                  (4, 'if node is None:'),
-                  (5, "bld.fatal('ref/gl: missing source file: ' + filename)"),
-                  (4, 'extra_nodes.append(node)'),
-                  (0, ''),
-                  (3, 'menu_source = source + extra_nodes'),
-                  (3, "menu_includes = ['.', 'imgui', 'imgui/backends']"),
-                  (3, "menu_defines += ['IMGUI_IMPL_OPENGL_ES2']"),
-                  (3, "menu_lib = ['GLESv2']"),
-                  (3, "menu_features = 'cxx format'"),
-                  (0, ''),
-                  (2, 'bld.shlib(source = menu_source,'),
-                  (3, 'target = k,'),
-                  (3, 'includes = menu_includes,'),
-                  (3, 'features = menu_features,'),
-                  (3, "use = libs + v['libs'],"),
-                  (3, 'defines = menu_defines,'),
-                  (3, 'lib = menu_lib,'),
-                  (3, 'install_path = bld.env.LIBDIR)'),
-              ]
-              new_bytes = b''.join(line(level, text) for level, text in replacement)
-              if w_bytes.count(old) == 1:
-                  updated = w_bytes.replace(old, new_bytes)
-                  compile(updated.decode('utf-8'), str(w_path), 'exec')
-                  w_path.write_bytes(updated)
-                  print("Wscript patched successfully (byte-level).")
-              else:
-                  print("Wscript structure differs, skipping patch.")
-
-          # 5. Патч IN_Move
-          in_path = Path("client/cl_dll/input/input_xash3d.cpp")
-          if in_path.exists():
-              in_txt = in_path.read_text()
-              helper = r'''#include <math.h>
-          static void vildan_move_fix( usercmd_t *cmd ) {
-              cl_entity_t *local = gEngfuncs.GetLocalPlayer();
-              if (!local) return;
-              cvar_t *bhop = gEngfuncs.pfnGetCvarPointer("vildan_bhop");
-              cvar_t *aim = gEngfuncs.pfnGetCvarPointer("vildan_aimbot");
-              if (bhop && bhop->value > 0.5f && (cmd->buttons & IN_JUMP)) {
-                  if (local->curstate.onground != -1) cmd->buttons |= IN_JUMP;
-                  else cmd->buttons &= ~IN_JUMP;
-              }
-              if (aim && aim->value > 0.5f && (cmd->buttons & IN_ATTACK)) {
-                  cl_entity_t *bt = NULL; float bd = 2000.0f; vec3_t d;
-                  for (int i = 1; i <= 32; i++) {
-                      cl_entity_t *e = gEngfuncs.GetEntityByIndex(i);
-                      if (!e || !e->player || e->curstate.health <= 0 || e->index == local->index) continue;
-                      float dist = sqrt((e->origin[0]-local->origin[0])*(e->origin[0]-local->origin[0]) + (e->origin[1]-local->origin[1])*(e->origin[1]-local->origin[1]) + (e->origin[2]-local->origin[2])*(e->origin[2]-local->origin[2]));
-                      if (dist < bd) { bd = dist; bt = e; }
-                  }
-                  if (bt) {
-                      d[0] = bt->origin[0] - local->origin[0]; d[1] = bt->origin[1] - local->origin[1]; d[2] = bt->origin[2] - local->origin[2];
-                      cmd->viewangles[0] = atan2f(d[2], sqrtf(d[0]*d[0] + d[1]*d[1])) * 180.0f / M_PI;
-                      cmd->viewangles[1] = atan2f(d[1], d[0]) * 180.0f / M_PI;
-                  }
-              }
-          }
-          '''
-              marker = "void IN_Move( float frametime, usercmd_t *cmd )\n{"
-              if marker in in_txt and "vildan_move_fix" not in in_txt:
-                  in_txt = in_txt.replace(marker, helper + "\n" + marker + "\n    vildan_move_fix(cmd);", 1)
-                  in_path.write_text(in_txt)
-
-          patch_file("client/cl_dll/cdll_int.cpp", 'static void LoadMenuInterface( void )\n{\n\tif( g_pMenu )\n\t\treturn;\n\n\tg_pMenu = GetNativeMenuExports();\n\tif( !g_pMenu )\n\t\tHUD_MessageBox( "Error: native object \\"MenuFactory\\" is unavailable\\n" );\n}', 'static void LoadMenuInterface( void )\n{\n\tg_pMenu = nullptr;\n}')
-
-          # 6. ПАТЧ NINJA (чтобы видеть ошибки Waf)
-          cfg_path = Path("engine/scripts/configure-ninja.py")
-          if cfg_path.exists():
-              cfg = cfg_path.read_text()
-              old_cfg = "\tprocess.communicate()\n\n\twith io.open"
-              new_cfg = "\tprocess.communicate()\n\tif process.returncode != 0:\n\t\traise SystemExit('Waf configure/ninja failed with exit code %d' % process.returncode)\n\tif not os.path.isfile(os.path.join(out_path, 'build.ninja')):\n\t\traise SystemExit('Waf finished without creating build.ninja')\n\n\twith io.open"
-              if old_cfg in cfg:
-                  cfg_path.write_text(cfg.replace(old_cfg, new_cfg, 1))
-                  print("configure-ninja.py patched to expose errors.")
-
-          PYEOF
-
-      - name: Build
-        run: |
           set -euo pipefail
-          cd engine
-          sed -i 's/ANDROID_NDK_VERSION=.*/ANDROID_NDK_VERSION="28.2.13676358"/' scripts/gha/deps_android.sh
-          sed -i 's/ndkVersion = .*/ndkVersion = "28.2.13676358"/' android/app/build.gradle.kts
-          sed -i 's/setOf("armeabi-v7a", "arm64-v8a", "x86")/setOf("arm64-v8a")/' android/app/build.gradle.kts
-          
-          GITHUB_WORKSPACE="$PWD" bash scripts/gha/deps_android.sh
-          
-          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
-          GITHUB_WORKSPACE="$PWD" bash scripts/gha/build_android.sh
-          
-          cd ../client/android
-          chmod +x gradlew
-          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
-          ./gradlew --no-daemon clean assembleGitDebug -Pandroid.injected.build.abi=arm64-v8a
+          init_submodules() {
+            local dir="$1"
+            pushd "$dir" > /dev/null
+            if git ls-files --stage | grep -q '^160000'; then
+              git submodule sync --recursive
+              git submodule update --init --recursive
+            else
+              git config -f .gitmodules --get-regexp '^submodule\..*\.path$' |
+              while read -r key path; do
+                name="${key#submodule.}"; name="${name%.path}"
+                url="$(git config -f .gitmodules --get "submodule.${name}.url")"
+                upd="$(git config -f .gitmodules --get "submodule.${name}.update" || true)"
+                [ "$upd" = "none" ] && continue
+                rm -rf "$path"
+                git clone --recursive "$url" "$path"
+              done
+            fi
+            popd > /dev/null
+          }
+          init_submodules engine
+          init_submodules client
+          if ! (cd engine && git ls-files --stage | grep -q '^160000'); then
+            git clone https://github.com/FWGS/nanogl engine/3rdparty/nanogl
+            git clone https://github.com/ptitSeb/gl4es engine/3rdparty/gl4es/gl4es
+            sed -i '/git submodule update --init --checkout 3rdparty\/nanogl/d' engine/scripts/gha/deps_android.sh
+          fi
 
-      - name: Save
-        if: always()
+      - name: Disable optional MenuFactory
+        shell: python
         run: |
-          mkdir -p out/apk
-          find engine -name "*.apk" | head -n 1 | xargs -I {} cp {} out/apk/VILDAN3D_Engine.apk || true
-          find client -name "*.apk" | head -n 1 | xargs -I {} cp {} out/apk/VILDAN3D_Client.apk || true
+          import pathlib
+          import sys
 
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: VILDAN3D
-          path: out/apk/*.apk
+          path = pathlib.Path("client/cl_dll/cdll_int.cpp")
+          content = path.read_text(encoding="utf-8")
+
+          old = 'static void LoadMenuInterface( void )\n{\n\tif( g_pMenu )\n\t\treturn;\n\n\tg_pMenu = GetNativeMenuExports();\n\tif( !g_pMenu )\n\t\tHUD_MessageBox( "Error: native object \\"MenuFactory\\" is unavailable\\n" );\n}'
+
+          new = 'static void LoadMenuInterface( void )\n{\n\tg_pMenu = nullptr;\n}'
+
+          count = content.count(old)
+          if count != 1:
+              sys.exit(f"MenuFactory patch: expected 1 match, found {count}")
+
+          path.write_text(content.replace(old, new, 1), encoding="utf-8")
+          print("MenuFactory loading disabled.")
+
+      - name: Patch Engine (Wallhack + No Recoil + Net Buffer)
+        shell: python
+        run: |
+          import os
+          import sys
+
+          def replace_once(path, old, new, desc):
+              if not os.path.exists(path):
+                  sys.exit(f"ERROR: File not found: {path}")
+
+              with open(path, "r") as f:
+                  content = f.read()
+
+              count = content.count(old)
+              if count != 1:
+                  sys.exit(f"ERROR: {desc}: expected 1 match, found {count}")
+
+              content = content.replace(old, new, 1)
+
+              with open(path, "w") as f:
+                  f.write(content)
+
+              print(f"Patched: {desc}")
+
+          # 1. Wallhack
+          renderer_path = "engine/ref/gl/gl_rmain.c"
+          old_renderer = "R_DrawStudioModel( RI.currententity );"
+          new_renderer = (
+              'if ( RI.currententity->player && gEngfuncs.pfnGetCvarPointer( "esp_enabled" ) && gEngfuncs.pfnGetCvarPointer( "esp_enabled" )->value > 0.5f )\n'
+              '{\n'
+              '    GLboolean old_depth = pglIsEnabled( GL_DEPTH_TEST );\n'
+              '    pglDisable( GL_DEPTH_TEST );\n'
+              '    R_DrawStudioModel( RI.currententity );\n'
+              '    if( old_depth ) pglEnable( GL_DEPTH_TEST );\n'
+              '    else pglDisable( GL_DEPTH_TEST );\n'
+              '}\n'
+              'else\n'
+              '{\n'
+              '    R_DrawStudioModel( RI.currententity );\n'
+              '}'
+          )
+          
+          if not os.path.exists(renderer_path):
+              sys.exit("ERROR: Renderer file not found")
+
+          with open(renderer_path, "r") as f:
+              content = f.read()
+
+          count = content.count(old_renderer)
+          if count != 2:
+              sys.exit(f"ERROR: Expected 2 renderer anchors, found {count}")
+
+          content = content.replace(old_renderer, new_renderer)
+
+          with open(renderer_path, "w") as f:
+              f.write(content)
+
+          print(f"Renderer patched for True Wallhack: {count} occurrences")
+
+          # 2. CVAR definitions
+          main_file = "engine/engine/client/cl_main.c"
+          replace_once(
+              main_file,
+              '#include "multi_emulator.h"',
+              '#include "multi_emulator.h"\nCVAR_DEFINE_AUTO( esp_enabled, "0", FCVAR_ARCHIVE, "Enable ESP" );\nCVAR_DEFINE_AUTO( norecoil, "0", FCVAR_ARCHIVE, "No Recoil" );',
+              "CVAR definitions"
+          )
+
+          # 3. No Recoil (engine) - soft
+          view_file = "engine/engine/client/cl_view.c"
+          if os.path.exists(view_file):
+              with open(view_file, "r") as f:
+                  content = f.read()
+              old_nr = "VectorCopy( cl.punchangle, fd->punchangle );"
+              new_nr = 'if( Cvar_VariableValue( "norecoil" ) > 0.5f )\n\t\tVectorClear( cl.punchangle );\n\tVectorCopy( cl.punchangle, fd->punchangle );'
+              if old_nr in content:
+                  content = content.replace(old_nr, new_nr, 1)
+                  print("Patched cl_view.c for No Recoil")
+              else:
+                  print("WARNING: Could not find punchangle in cl_view.c")
+              with open(view_file, "w") as f:
+                  f.write(content)
+
+          # 4. ESP color
+          frame_file = "engine/engine/client/cl_frame.c"
+          replace_once(
+              frame_file,
+              "ent->curstate.rendermode = kRenderTransAdd;",
+              "ent->curstate.rendermode = kRenderTransColor; ent->curstate.rendercolor.r = 255; ent->curstate.rendercolor.g = 0; ent->curstate.rendercolor.b = 0; ent->curstate.renderamt = 255;",
+              "ESP render mode"
+          )
+
+          # 5. Net buffer (soft)
+          net_chan_file = "engine/common/net_chan.h"
+          if os.path.exists(net_chan_file):
+              with open(net_chan_file, "r") as f:
+                  content = f.read()
+              patched = False
+              for old_val in ["16384", "0x4000", "32768", "0x8000"]:
+                  old_str = f"#define NET_MAX_MESSAGE {old_val}"
+                  if old_str in content:
+                      content = content.replace(old_str, "#define NET_MAX_MESSAGE 65536", 1)
+                      print(f"Patched NET_MAX_MESSAGE from {old_val} to 65536")
+                      patched = True
+                      break
+              if not patched:
+                  print("WARNING: Could not find NET_MAX_MESSAGE definition")
+              with open(net_chan_file, "w") as f:
+                  f.write(content)
+          else:
+              print("WARNING: net_chan.h not found")
+
+      - name: Patch Client (Aimbot + Bhop + No Recoil + FOV)
+        shell: python
+        run: |
+          import os
+          import sys
+
+          def replace_once(path, old, new, desc):
+              if not os.path.exists(path):
+                  sys.exit(f"ERROR: File not found: {path}")
+
+              with open(path, "r") as f:
+                  content = f.read()
+
+              count = content.count(old)
+              if count != 1:
+                  sys.exit(f"ERROR: {desc}: expected 1 match, found {count}")
+
+              content = content.replace(old, new, 1)
+
+              with open(path, "w") as f:
+                  f.write(content)
+
+              print(f"Patched: {desc}")
+
+          input_file = 'client/cl_dll/input/input_xash3d.cpp'
+          replace_once(
+              input_file,
+              'bool g_bAimbotEnabled = false;',
+              'bool g_bAimbotEnabled = false;\nbool g_bBhopEnabled = false;',
+              'Global Vars'
+          )
+          replace_once(
+              input_file,
+              'void ToggleAimbot( void )',
+              'void ToggleBhop( void )\n{\n    g_bBhopEnabled = !g_bBhopEnabled;\n}\n\nvoid ToggleAimbot( void )',
+              'ToggleBhop func'
+          )
+          replace_once(
+              input_file,
+              'gEngfuncs.pfnAddCommand( "toggle_aim", ToggleAimbot );',
+              'gEngfuncs.pfnAddCommand( "toggle_aim", ToggleAimbot );\n\tgEngfuncs.pfnAddCommand( "toggle_bhop", ToggleBhop );',
+              'Bhop command'
+          )
+
+          old_in_move = 'void IN_Move( float frametime, usercmd_t *cmd )\n{'
+
+          new_in_move = (
+              "void IN_Move( float frametime, usercmd_t *cmd )\n"
+              "{\n"
+              "    cl_entity_t *local = gEngfuncs.GetLocalPlayer();\n"
+              "\n"
+              "    if ( local && g_bBhopEnabled && ( cmd->buttons & IN_JUMP ) )\n"
+              "    {\n"
+              "        if ( local->curstate.onground != -1 )\n"
+              "        {\n"
+              "            cmd->buttons |= IN_JUMP;\n"
+              "        }\n"
+              "        else\n"
+              "        {\n"
+              "            cmd->buttons &= ~IN_JUMP;\n"
+              "        }\n"
+              "    }\n"
+              "\n"
+              "    if ( g_bAimbotEnabled && local && ( cmd->buttons & IN_ATTACK ) )\n"
+              "    {\n"
+              "        cl_entity_t *best_target = NULL;\n"
+              "        float best_dist = 99999.0f;\n"
+              "        vec3_t delta;\n"
+              "        float fov = 90.0f;\n"
+              "\n"
+              "        for ( int i = 1; i <= 32; i++ )\n"
+              "        {\n"
+              "            cl_entity_t *ent = gEngfuncs.GetEntityByIndex(i);\n"
+              "            if ( ent && ent->player && ent->curstate.health > 0 && ent->index != local->index )\n"
+              "            {\n"
+              "                delta[0] = ent->origin[0] - local->origin[0];\n"
+              "                delta[1] = ent->origin[1] - local->origin[1];\n"
+              "                delta[2] = ent->origin[2] - local->origin[2];\n"
+              "                float dist = sqrt(delta[0]*delta[0] + delta[1]*delta[1] + delta[2]*delta[2]);\n"
+              "                if ( dist < best_dist && dist < 2000.0f )\n"
+              "                {\n"
+              "                    float hyp = sqrt(delta[0]*delta[0] + delta[1]*delta[1]);\n"
+              "                    float target_pitch = atan2(delta[2], hyp) * 180.0f / M_PI;\n"
+              "                    float target_yaw = atan2(delta[1], delta[0]) * 180.0f / M_PI;\n"
+              "                    \n"
+              "                    float pitch_diff = fabs( target_pitch - cmd->viewangles[0] );\n"
+              "                    float yaw_diff = fabs( target_yaw - cmd->viewangles[1] );\n"
+              "                    \n"
+              "                    if ( pitch_diff < fov && yaw_diff < fov )\n"
+              "                    {\n"
+              "                        best_dist = dist;\n"
+              "                        best_target = ent;\n"
+              "                    }\n"
+              "                }\n"
+              "            }\n"
+              "        }\n"
+              "        if ( best_target )\n"
+              "        {\n"
+              "            delta[0] = best_target->origin[0] - local->origin[0];\n"
+              "            delta[1] = best_target->origin[1] - local->origin[1];\n"
+              "            delta[2] = best_target->origin[2] - local->origin[2];\n"
+              "            float hyp = sqrt(delta[0]*delta[0] + delta[1]*delta[1]);\n"
+              "            cmd->viewangles[0] = atan2(delta[2], hyp) * 180.0f / M_PI;\n"
+              "            cmd->viewangles[1] = atan2(delta[1], delta[0]) * 180.0f / M_PI;\n"
+              "        }\n"
+              "    }\n"
+          )
+          replace_once(input_file, old_in_move, new_in_move, 'IN_Move start')
+
+          # No Recoil (client) - soft
+          view_cpp = 'client/cl_dll/view.cpp'
+          if os.path.exists(view_cpp):
+              with open(view_cpp, "r") as f:
+                  content = f.read()
+              old_punch = 'pparams->viewangles = pparams->cl_viewangles + pparams->punchangle + ev_punchangle;'
+              new_punch = 'pparams->viewangles = pparams->cl_viewangles + ev_punchangle;'
+              if old_punch in content:
+                  content = content.replace(old_punch, new_punch, 1)
+                  print("Patched view.cpp for No Recoil (client)")
+              else:
+                  print("WARNING: Could not find punchangle line in view.cpp")
+              with open(view_cpp, "w") as f:
+                  f.write(content)
+
+          # FOV Circle in hud.cpp - soft
+          hud_file = 'client/cl_dll/hud.cpp'
+          if os.path.exists(hud_file):
+              with open(hud_file, "r") as f:
+                  content = f.read()
+
+              draw_funcs = (
+                  "\n"
+                  "#include <math.h>\n"
+                  "#include <stdlib.h>\n"
+                  "#ifndef M_PI\n"
+                  "#define M_PI 3.14159265358979323846\n"
+                  "#endif\n"
+                  "\n"
+                  "extern bool g_bAimbotEnabled;\n"
+                  "\n"
+                  "static void DrawDebugCircle(int cx, int cy, int radius, int segments, int r, int g, int b, int a)\n"
+                  "{\n"
+                  "    if (radius <= 0 || segments < 3) return;\n"
+                  "    float previousX = cx + radius;\n"
+                  "    float previousY = cy;\n"
+                  "    for (int i = 1; i <= segments; i++)\n"
+                  "    {\n"
+                  "        float angle = (float)i * 2.0f * (float)M_PI / segments;\n"
+                  "        float currentX = cx + cosf(angle) * radius;\n"
+                  "        float currentY = cy + sinf(angle) * radius;\n"
+                  "        int x1 = (int)previousX;\n"
+                  "        int y1 = (int)previousY;\n"
+                  "        int x2 = (int)currentX;\n"
+                  "        int y2 = (int)currentY;\n"
+                  "        int dx = abs(x2 - x1);\n"
+                  "        int dy = abs(y2 - y1);\n"
+                  "        int sx = x1 < x2 ? 1 : -1;\n"
+                  "        int sy = y1 < y2 ? 1 : -1;\n"
+                  "        int error = dx - dy;\n"
+                  "        while (true)\n"
+                  "        {\n"
+                  "            FillRGBA(x1, y1, 2, 2, r, g, b, a);\n"
+                  "            if (x1 == x2 && y1 == y2) break;\n"
+                  "            int e2 = 2 * error;\n"
+                  "            if (e2 > -dy) { error -= dy; x1 += sx; }\n"
+                  "            if (e2 < dx) { error += dx; y1 += sy; }\n"
+                  "        }\n"
+                  "        previousX = currentX;\n"
+                  "        previousY = currentY;\n"
+                  "    }\n"
+                  "}\n"
+                  "\n"
+                  "static void DrawCameraFOVDebug()\n"
+                  "{\n"
+                  "    const float debugFOV = 90.0f;\n"
+                  "    float cameraFOV = (float)gHUD.m_iFOV;\n"
+                  "    if (cameraFOV <= 0.0f) cameraFOV = 90.0f;\n"
+                  "    const float halfScreen = ScreenWidth * 0.5f;\n"
+                  "    float radius = halfScreen * tanf(debugFOV * (float)M_PI / 360.0f) / tanf(cameraFOV * (float)M_PI / 360.0f);\n"
+                  "    int cx = ScreenWidth / 2;\n"
+                  "    int cy = ScreenHeight / 2;\n"
+                  "    DrawDebugCircle(cx, cy, (int)radius, 96, 0, 255, 0, 180);\n"
+                  "}\n"
+                  "\n"
+              )
+
+              search_str = 'void CHud::Redraw( float flTime, int intermission )'
+              if search_str in content:
+                  content = content.replace(search_str, draw_funcs + search_str, 1)
+                  start_idx = content.find(search_str)
+                  brace_idx = content.find('{', start_idx)
+                  if brace_idx != -1:
+                      inject = '\n\tif ( g_bAimbotEnabled ) DrawCameraFOVDebug();\n'
+                      content = content[:brace_idx+1] + inject + content[brace_idx+1:]
+                      print("Injected FOV circle into hud.cpp")
+                  else:
+                      print("WARNING: Could not find brace for CHud::Redraw")
+              else:
+                  print("WARNING: Could not find CHud::Redraw in hud.cpp")
+
+              with open(hud_file, 'w') as f:
+                  f.write(content)
+
+      - name: Fix VectorSubtract and check
+        shell: python
+        run: |
+          import pathlib
+          import sys
+
+          path = pathlib.Path("client/cl_dll/input/input_xash3d.cpp")
+
+          if not path.exists():
+              sys.exit("ERROR: input_xash3d.cpp not found")
+
+          content = path.read_text(encoding="utf-8")
+
+          replacements = [
+              (
+                  "VectorSubtract( ent->origin, local->origin, delta );",
+                  "delta[0] = ent->origin[0] - local->origin[0];\n"
+                  "                delta[1] = ent->origin[1] - local->origin[1];\n"
+                  "                delta[2] = ent->origin[2] - local->origin[2];"
+              ),
+              (
+                  "VectorSubtract( best_target->origin, local->origin, delta );",
+                  "delta[0] = best_target->origin[0] - local->origin[0];\n"
+                  "                delta[1] = best_target->origin[1] - local->origin[1];\n"
+                  "                delta[2] = best_target->origin[2] - local->origin[2];"
+              )
+          ]
+
+          for old, new in replacements:
+              count = content.count(old)
+              if count != 1:
+                  print(f"WARNING: Expected 1 occurrence, found {count}: {old}")
+              else:
+                  content = content.replace(old, new, 1)
+
+          if "VectorSubtract(" in content:
+              print("ERROR: Other VectorSubtract calls remain!")
+              sys.exit(1)
+
+          path.write_text(c
